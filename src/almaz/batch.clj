@@ -6,7 +6,9 @@
 
    A file that fails is reported and skipped; the run carries on and the exit
    status says whether everything went through."
-  (:require [almaz.cli :as cli]
+  (:require [almaz.autopilot :as ap]
+            [almaz.cli :as cli]
+            [almaz.doc :as d]
             [almaz.engine :as eng]
             [almaz.models :as models]
             [almaz.pixels :as px]
@@ -38,14 +40,25 @@
                    :op (eng/op-for f (model-session f))})
     out))
 
+(defn- light-entry
+  "A light layer's stack entry; exposure=auto is measured on the image below."
+  [base below f]
+  (let [f (if (= :auto (:exposure f))
+            (assoc f :exposure (ap/auto-exposure (:l (px/histogram base below))))
+            f)]
+    {:tone (d/tone f) :opacity (:opacity f) :enabled true}))
+
 (defn- run-filters!
   "Run `filters` in order over `base`; returns the layer stack (each output
-   is also recorded in the `outputs` atom, so it is freed whatever happens)."
+   is also recorded in the `outputs` atom, so it is freed whatever happens).
+   Light adjustments need no run: the writer applies them."
   [base filters outputs]
   (reduce (fn [below f]
-            (let [img (run-filter! base below f)]
-              (swap! outputs conj img)
-              (conj below {:img img :opacity (:opacity f) :enabled true})))
+            (if (d/live? f)
+              (conj below (light-entry base below f))
+              (let [img (run-filter! base below f)]
+                (swap! outputs conj img)
+                (conj below {:img img :opacity (:opacity f) :enabled true}))))
           [] filters))
 
 (defn- export! [opts path base layers]

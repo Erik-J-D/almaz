@@ -26,3 +26,19 @@
   (is (ap/noisy? {:noise 0.02}))
   (is (not (ap/noisy? {:noise 0.001})))
   (is (not (ap/noisy? nil))))
+
+(defn- hist-with
+  "A 256-bin luma histogram: `n` pixels at each [bin n]."
+  [& bins]
+  (reduce (fn [h [i n]] (update h i + n)) (vec (repeat 256 0)) bins))
+
+(deftest auto-exposure
+  (testing "lifts the image until its brightest 1% reaches white"
+    ;; 99% at bin 50, 1% at bin 64 (sRGB 0.251, 0.0513 linear): 2^4.28 brings it to 1.0
+    (is (< 4.2 (ap/auto-exposure (hist-with [50 990] [64 10])) 4.35)))
+  (testing "an image that already reaches white needs nothing"
+    (is (= 0.0 (ap/auto-exposure (hist-with [100 900] [255 100])))))
+  (testing "a dark frame is lifted at most to the slider's end"
+    (is (= 5.0 (ap/auto-exposure (hist-with [1 1000])))))
+  (testing "an empty histogram leaves exposure alone"
+    (is (= 0.0 (ap/auto-exposure (vec (repeat 256 0)))))))

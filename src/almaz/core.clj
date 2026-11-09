@@ -33,7 +33,7 @@
    in development and smoke tests."
   []
   (when-let [f (System/getenv "ALMAZ_SCRIPT")]
-    (.start (Thread. (fn [] (Thread/sleep 1500) (load-file f))))))
+    (doto (Thread. (fn [] (Thread/sleep 1500) (load-file f))) (.setDaemon true) (.start))))
 
 (defn- open-app! [files]
   (worker/start!)

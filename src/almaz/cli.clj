@@ -21,6 +21,12 @@ Filters (settings follow the flag as key=value):
   --noise   [strength=0..100] [detail=0..100] [enabled=false]
   --sharpen [strength=0..100] [model=ai|classic] [radius=0.5..8]
             [amount=0..300] [enabled=false]
+  --light   [exposure=-5..5|auto] [contrast=-100..100] [highlights=..]
+            [shadows=..] [whites=..] [blacks=..] [saturation=..]
+            [strength=0..100] [enabled=false]
+            light adjustments over the result (exposure in EV; auto lifts
+            the image until its brightest 1% reaches white); none unless
+            asked for: RAW files keep their recorded exposure
   --override        run exactly the filters given (autopilot off); otherwise
                     autopilot picks filters per image and these adjust them
   --showSettings    print each image's estimate and filters before processing
@@ -33,12 +39,17 @@ Output:
 
 Results are named <input>-almaz.<ext> and keep the input's EXIF.")
 
-(def ^:private filter-flags {"--noise" :noise "--sharpen" :sharpen})
+(def ^:private filter-flags {"--noise" :noise "--sharpen" :sharpen "--light" :light})
+
+(def ^:private tone-range [-100.0 100.0])
 
 (def ^:private filter-keys
   {:noise   {"strength" :number "detail" :number "enabled" :bool}
    :sharpen {"strength" :number "model" #{"ai" "classic"} "radius" :number
-             "amount" :number "enabled" :bool}})
+             "amount" :number "enabled" :bool}
+   :light   {"exposure" :exposure "contrast" tone-range "highlights" tone-range
+             "shadows" tone-range "whites" tone-range "blacks" tone-range
+             "saturation" tone-range "strength" :number "enabled" :bool}})
 
 (def ^:private formats {"jpeg" :jpeg "jpg" :jpeg "tiff" :tiff16 "tif" :tiff16
                         "png" :png16 "png8" :png8})
@@ -58,22 +69,47 @@ Results are named <input>-almaz.<ext> and keep the input's EXIF.")
 (defn- parse-number [s]
   (try (Double/parseDouble s) (catch Exception _ nil)))
 
+(defn- number-setting [k v]
+  (if-let [n (parse-number v)] [(keyword k) n] {:error (str k " must be a number, got " v)}))
+
+(defn- bool-setting [k v]
+  (if (#{"true" "false"} v) [(keyword k) (= v "true")] {:error (str k " must be true or false, got " v)}))
+
+(defn- exposure-setting [_ v]
+  (let [n (parse-number v)]
+    (cond (= v "auto") [:exposure :auto]
+          (and n (<= -5.0 n 5.0)) [:exposure n]
+          :else {:error (str "exposure must be -5..5 or auto, got " v)})))
+
+(defn- range-setting [[lo hi]]
+  (fn [k v]
+    (let [n (parse-number v)]
+      (if (and n (<= lo n hi))
+        [(keyword k) n]
+        {:error (str k " must be " (long lo) ".." (long hi) ", got " v)}))))
+
+(defn- choice-setting [choices]
+  (fn [k v]
+    (if (choices v)
+      [(keyword k) (keyword v)]
+      {:error (str k " must be one of " (str/join ", " (sort choices)) ", got " v)})))
+
+(defn- setting-parser
+  "How a filter key's value parses (filter-keys' kinds)."
+  [kind]
+  (cond (= kind :number) number-setting
+        (= kind :bool) bool-setting
+        (= kind :exposure) exposure-setting
+        (vector? kind) (range-setting kind)
+        (set? kind) (choice-setting kind)))
+
 (defn- parse-setting
   "[key value] for one `k=v` of filter `f`, or {:error msg}."
   [f token]
-  (let [[k v] (str/split token #"=" 2)
-        kind (get-in filter-keys [f k])]
-    (cond
-      (nil? kind) {:error (str "--" (name f) " has no setting " k)}
-      (= kind :number) (if-let [n (parse-number v)]
-                         [(keyword k) n]
-                         {:error (str k " must be a number, got " v)})
-      (= kind :bool) (if (#{"true" "false"} v)
-                       [(keyword k) (= v "true")]
-                       {:error (str k " must be true or false, got " v)})
-      (set? kind) (if (kind v)
-                    [(keyword k) (keyword v)]
-                    {:error (str k " must be one of " (str/join ", " (sort kind)) ", got " v)}))))
+  (let [[k v] (str/split token #"=" 2)]
+    (if-let [kind (get-in filter-keys [f k])]
+      ((setting-parser kind) k v)
+      {:error (str "--" (name f) " has no setting " k)})))
 
 (defn- setting? [token] (and (str/includes? token "=") (not (str/starts-with? token "-"))))
 
@@ -140,23 +176,29 @@ Results are named <input>-almaz.<ext> and keep the input's EXIF.")
       :else (recur (update o :files conj a) more))))
 
 ;; ---- planning ----------------------------------------------------------------
-(def ^:private flag->kind {:noise :denoise :sharpen :sharpen})
+(def ^:private flag->kind {:noise :denoise :sharpen :sharpen :light :light})
 
 (defn- pct [x] (/ (double x) 100.0))
 
+(def ^:private percent-tones [:contrast :highlights :shadows :whites :blacks :saturation])
+
 (defn- apply-settings
   "Fold one flag's settings into the filter it names."
-  [{:keys [strength detail model radius amount]} current]
-  (cond-> current
+  [{:keys [strength detail model radius amount exposure] :as settings} current]
+  (cond-> (reduce (fn [acc k] (if-let [v (get settings k)] (assoc acc k (pct v)) acc))
+                  current percent-tones)
     strength (assoc :opacity (pct strength))
     detail (assoc :detail (pct detail))
     model (assoc :model model)
     radius (assoc :radius radius)
-    amount (assoc :amount (pct amount))))
+    amount (assoc :amount (pct amount))
+    exposure (assoc :exposure exposure)))
 
 (defn plan
   "The filters to run on an image with estimate `est`, in pipeline order:
-   [{:kind :opacity :model :detail :amount :radius} ...]."
+   [{:kind :opacity :model :detail :amount :radius} ...] (a :light layer
+   carries the tone settings; its :exposure may be :auto). Autopilot never
+   adds light adjustments."
   [{:keys [filters override]} est]
   (let [chosen (if override
                  {}
@@ -180,16 +222,23 @@ Results are named <input>-almaz.<ext> and keep the input's EXIF.")
         dir (or out (.getParent f))]
     (str (when dir (str dir "/")) stem "-almaz." (ext format))))
 
+(defn- describe-light [{:keys [exposure] :as f}]
+  (apply str
+         (if (= :auto exposure) " exposure auto" (format " exposure %+.2g EV" (double exposure)))
+         (for [k percent-tones :let [v (get f k)] :when (not= 0.0 v)]
+           (str " " (name k) " " (Math/round (* 100.0 v))))))
+
 (defn describe
   "What --showSettings prints for one image."
   [input est filters]
   (str input ": " (ap/describe est)
        (if (empty? filters)
          "\n  no filters"
-         (apply str (for [{:keys [kind opacity model detail radius amount]} filters]
+         (apply str (for [{:keys [kind opacity model detail radius amount] :as f} filters]
                       (str "\n  " (name kind) " " (Math/round (* 100.0 opacity)) "%"
                            (case [kind model]
                              [:denoise :ai] (str " detail " (Math/round (* 100.0 detail)) "%")
                              [:sharpen :ai] " AI deblur"
                              [:sharpen :classic] (str " unsharp radius " radius
-                                                      " amount " (Math/round (* 100.0 amount)) "%"))))))))
+                                                      " amount " (Math/round (* 100.0 amount)) "%")
+                             [:light :classic] (describe-light f))))))))

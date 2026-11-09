@@ -3,7 +3,12 @@
    They run on the UI thread; slow work is left to the worker (almaz.worker)."
   (:require [clojure.string :as str]
             [glimmer-bui.ffi :as bk]
+            [almaz.autopilot :as ap]
+            [almaz.color :as c]
             [almaz.doc :as d]
+            [almaz.engine :as eng]
+            [almaz.geom :as g]
+            [almaz.history :as h]
             [almaz.lifecycle :as life]
             [almaz.pixels :as px]
             [almaz.raw :as raw]
@@ -28,8 +33,8 @@
       (reset! s/current* id)
       (swap! s/tool* assoc :mode :pan :layer nil)
       (swap! s/view* assoc :zoom :fit)
-      (when-let [{:keys [w h]} (s/doc id)]
-        (when w (swap! s/view* v/fit w h)))
+      (when-let [[w h] (s/display-size (s/doc id))]
+        (swap! s/view* v/fit w h))
       (s/wake!))))
 
 (defn add-images!
@@ -54,48 +59,160 @@
                                     :filters open-filters})]
     (add-images! paths)))
 
+(declare forget-history!)
+
 (defn remove-doc! [id]
   (when (s/doc id)
+    (forget-history! id)
     (apply life/retire! (s/swap-db-with! (fn [db] [(d/remove-doc db id) (life/doc-natives db id)])))
     (when (= id @s/current*)
       (reset! s/current* nil)
       (when-let [n (first (d/docs @s/db*))] (select-doc! (:id n))))))
 
-;; ---- layers ----------------------------------------------------------------
+;; ---- undo history ----------------------------------------------------------
+;; Every user edit first records the doc's state (almaz.history); edits with
+;; the same key in quick succession (a slider drag) are one step. Mask edits
+;; also keep a copy of the mask they change.
 (defn- cur-id [] @s/current*)
 
-(defn add-layer! [kind]
+(def undo-limit "Undo steps kept per image." 10)
+
+(defn- drop-entries!
+  "Free the mask copies of history entries no longer kept."
+  [entries]
+  (apply life/retire! (for [e entries [_ m] (:masks e)] [:mask m])))
+
+(defn- entry-now
+  "The current doc's state as a history entry, with copies of the masks of
+   layers `lids`."
+  [id lids]
+  {:state (h/snapshot @s/db* id)
+   :masks (into {} (keep (fn [lid] (when-let [m (:mask (s/layer lid))] [lid (px/mask-copy m)]))) lids)})
+
+(defn- record!
+  "Remember the current doc's state before an edit. `key`: same-key edits
+   soon after are one step (nil: always a step of its own); `mask-lids`: the
+   layers whose masks the edit paints."
+  ([key] (record! key nil))
+  ([key mask-lids]
+   (when-let [id (cur-id)]
+     (let [[hist dropped] (h/record (get @s/history* id h/empty) (entry-now id mask-lids)
+                                    {:key key :at (s/now)} undo-limit)]
+       (swap! s/history* assoc id hist)
+       (drop-entries! dropped)))))
+
+(defn- forget-history! [id]
+  (let [{:keys [undo redo]} (get @s/history* id)]
+    (swap! s/history* dissoc id)
+    (drop-entries! (concat undo redo))))
+
+(defn can-undo? [] (h/can-undo? (get @s/history* (cur-id))))
+(defn can-redo? [] (h/can-redo? (get @s/history* (cur-id))))
+
+;; ---- layers ----------------------------------------------------------------
+;; One layer per kind, made the first time it is switched on or edited.
+
+(defn- kind-layer!
+  "The current doc's layer of `kind`, created (with its mask) if it has none."
+  [kind]
   (when-let [id (cur-id)]
-    (s/edit! id (fn [db] (first (d/add-layer db id kind))))
-    (life/ensure-masks! id)))
+    (or (:id (d/layer-of @s/db* id kind))
+        (do (s/edit! id (fn [db] (first (d/ensure-layer db id kind))))
+            (life/ensure-masks! id)
+            (:id (d/layer-of @s/db* id kind))))))
 
-(defn remove-layer! [lid]
+(defn set-enabled!
+  "Switch the current doc's `kind` filter on or off."
+  [kind on?]
   (when-let [id (cur-id)]
-    (when-let [l (s/layer lid)]
-      (s/edit! id d/remove-layer lid)
-      (apply life/retire! (life/layer-natives l))
-      (when (= lid (:layer @s/tool*)) (swap! s/tool* assoc :mode :pan :layer nil)))))
+    (record! nil)
+    (if on?
+      (let [lid (kind-layer! kind)] (s/edit! id d/update-layer lid assoc :enabled true))
+      (when-let [l (d/layer-of @s/db* id kind)]
+        (s/edit! id d/update-layer (:id l) assoc :enabled false)
+        (when (= (:id l) (:layer @s/tool*)) (swap! s/tool* assoc :mode :pan :layer nil))))))
 
-(defn move-layer! [lid dir] (when-let [id (cur-id)] (s/edit! id d/move-layer lid dir)))
-(defn set-param! [lid k val] (when-let [id (cur-id)] (s/edit! id d/set-param lid k val)))
-(defn set-layer! [lid k val] (when-let [id (cur-id)] (s/edit! id d/update-layer lid assoc k val)))
+(defn- edit-kind!
+  "Apply `f` (db lid -> db) to the `kind` layer, switching it on: touching a
+   filter's settings means wanting to see it. `key`: the undo step (see
+   record!)."
+  [kind key f]
+  (record! key)
+  (when-let [lid (kind-layer! kind)]
+    (s/edit! (cur-id) (fn [db] (f (d/update-layer db lid assoc :enabled true) lid)))))
 
-(defn- with-mask! [lid f]
+(defn set-param! [kind k val] (edit-kind! kind [:param kind k] (fn [db lid] (d/set-param db lid k val))))
+(defn set-layer! [kind k val] (edit-kind! kind [:layer kind k] (fn [db lid] (d/update-layer db lid assoc k val))))
+(defn reset-kind!
+  "Put a filter's settings back to their defaults."
+  [kind]
+  (when-let [l (some-> (cur-id) (#(d/layer-of @s/db* % kind)))]
+    (record! nil)
+    (s/edit! (cur-id) d/reset-params (:id l))))
+
+(defn auto-exposure!
+  "Set the light layer's exposure so the image under it reaches white (its
+   brightest 1%), the brightening raw converters otherwise apply unasked."
+  []
+  (when-let [{:keys [id base] :as dc} (s/current-doc)]
+    (when base
+      (let [below (take-while #(not= :light (:kind %)) (s/layers id))
+            {:keys [l]} (px/histogram base (eng/layer-refs dc below))]
+        (set-param! :light :exposure (ap/auto-exposure l))))))
+
+(defn set-level!
+  "Move a levels point (almaz.color/set-level)."
+  [ch which v]
+  (edit-kind! :levels [:level ch which]
+              (fn [db lid]
+                        (let [l (d/layer db lid)
+                              p (c/set-level (second (d/colour l)) ch which v)]
+                          (d/update-layer db lid merge p)))))
+
+(defn start-pick!
+  "The next click on the image sets levels' `which` point (:black :grey :white)."
+  [which]
+  (swap! s/tool* assoc :mode :pick :pick which :layer nil))
+
+(defn pick!
+  "Set the levels point being picked from the image at source pixel p: the
+   colour levels receives there (the stack below it)."
+  [p]
+  (when-let [{:keys [id base] :as dc} (s/current-doc)]
+    (let [which (:pick @s/tool*)]
+      (swap! s/tool* assoc :mode :pan :pick nil)
+      (when (and base which)
+        (let [below (take-while #(not= :levels (:kind %)) (s/layers id))
+              rgb (px/sample base (eng/layer-refs dc below) p 2)]
+          (edit-kind! :levels nil
+                      (fn [db lid]
+                                (d/update-layer db lid merge
+                                                (c/pick-level (second (d/colour (d/layer db lid))) which rgb)))))))))
+
+(defn- with-mask!
+  "Apply `f` to layer `lid`'s mask, an undo step (same-key ones merge)."
+  [lid key f]
   (when-let [id (cur-id)]
     (when-let [m (:mask (s/layer lid))]
+      (record! key [lid])
       (f m)
       (s/edit! id d/bump-mask lid)
       (s/bump-pixels!))))
 
-(defn mask-fill! [lid value] (with-mask! lid #(px/mask-fill! % value)))
-(defn mask-invert! [lid] (with-mask! lid px/mask-invert!))
+(defn mask-fill! [lid value] (with-mask! lid nil #(px/mask-fill! % value)))
+(defn mask-invert! [lid] (with-mask! lid nil px/mask-invert!))
 
 (defn set-feather! [lid sigma]
-  (with-mask! lid #(px/mask-feather! % sigma))
-  (set-layer! lid :feather (double sigma)))
+  (with-mask! lid [:feather lid] #(px/mask-feather! % sigma))
+  (when-let [id (cur-id)] (s/edit! id d/update-layer lid assoc :feather (double sigma))))
+
+(defn begin-stroke!
+  "A brush stroke on layer `lid`'s mask starts: an undo step."
+  [lid]
+  (record! nil [lid]))
 
 (defn set-tool! [mode lid]
-  (swap! s/tool* assoc :mode mode :layer (when (not= mode :pan) lid)))
+  (swap! s/tool* assoc :mode mode :layer (when (not= mode :pan) lid) :pick nil))
 
 ;; ---- autopilot -------------------------------------------------------------
 (defn set-autopilot! [on?]
@@ -106,13 +223,97 @@
       (life/ensure-masks! (:id dc)))))
 
 ;; ---- view ------------------------------------------------------------------
-(defn- doc-size []
-  (when-let [{:keys [w h]} (s/current-doc)] (when w [w h])))
+(defn- doc-size [] (s/display-size (s/current-doc)))
+
+(defn- refit!
+  "Fit the image again if the view is fitted (what it shows changed size)."
+  []
+  (when (= :fit (:zoom @s/view*))
+    (when-let [[w h] (doc-size)] (swap! s/view* v/fit w h))))
+
+(defn set-tab!
+  "Show sidebar tab `tab`; the Dimensions tab shows the whole image to crop."
+  [tab]
+  (when (not= tab @s/tab*)
+    (reset! s/tab* tab)
+    (swap! s/tool* assoc :mode :pan :layer nil :pick nil)
+    (swap! s/view* assoc :zoom :fit)
+    (refit!)))
+
+;; ---- geometry --------------------------------------------------------------
+(defn- edit-geom!
+  "Apply `f` (doc -> doc) to the current doc's orientation and crop, an undo
+   step of `key`."
+  [key f & args]
+  (when-let [id (cur-id)]
+    (when (:w (s/doc id))
+      (record! key)
+      (s/edit! id (fn [db] (d/update-doc db id #(apply f % args))))
+      (refit!))))
+
+(defn rotate! [dir] (edit-geom! nil (fn [dc] (update dc :orient #(g/rotate (or % 0) dir)))))
+(defn flip-h! [] (edit-geom! nil (fn [dc] (update dc :orient #(g/flip-h (or % 0))))))
+(defn flip-v! [] (edit-geom! nil (fn [dc] (update dc :orient #(g/flip-v (or % 0))))))
+(defn set-constrain! [k] (edit-geom! nil g/constrain k))
+(defn set-crop-size! [w h] (edit-geom! [:crop-size] g/with-crop-size [(max g/min-crop (long w)) (max g/min-crop (long h))]))
+(defn set-ratio!
+  "The custom aspect ratio's w and h."
+  [rw rh]
+  (edit-geom! [:ratio] (fn [dc] (g/constrain (assoc dc :ratio-w (max 0.01 (double rw)) :ratio-h (max 0.01 (double rh)))
+                                    :custom-ratio))))
+(defn reset-crop! []
+  (edit-geom! nil (fn [dc] (assoc dc :crop-x nil :crop-y nil :crop-w nil :crop-h nil :constrain :free))))
+(defn set-display-crop!
+  "Set the crop from the crop editor's rect (display coordinates)."
+  [rect]
+  (when-let [id (cur-id)]
+    (record! [:crop-drag])
+    (s/edit! id (fn [db] (d/update-doc db id #(g/with-display-crop % rect))))))
+
+;; ---- undo / redo -----------------------------------------------------------
+(defn- apply-entry!
+  "Put the doc back to history entry `e`: its state, and its masks."
+  [id {:keys [state masks]}]
+  ;; an undo is complete in itself: processing needn't wait for more
+  (s/edit-done! id (fn [db] (h/restore db id state)))
+  (doseq [[lid snap] masks]
+    (when-let [m (:mask (s/layer lid))]
+      (px/mask-restore! m snap)
+      (s/edit-done! id d/bump-mask lid)))
+  (when (seq masks) (s/bump-pixels!))
+  ;; its mask copies are back in the masks: no longer needed
+  (drop-entries! [{:masks masks}])
+  (refit!))
+
+(defn- step!
+  "Undo (h/undo, the :undo end) or redo (h/redo, the :redo end)."
+  [move end done]
+  (when-let [id (cur-id)]
+    (let [hist (get @s/history* id h/empty)]
+      (when-let [e (peek (end hist))]
+        (let [[hist' e] (move hist (entry-now id (keys (:masks e))))]
+          (swap! s/history* assoc id hist')
+          (apply-entry! id e)
+          (s/message! done))))))
+
+(defn undo! "Take back the last edit to the current image." [] (step! h/undo :undo "Undone"))
+(defn redo! "Do again what undo took back." [] (step! h/redo :redo "Redone"))
+
+;; ---- repair ----------------------------------------------------------------
+(defn repair-tool!
+  "Brush with the Repair tool: switch Repair on and paint its mask."
+  []
+  (when (:base (s/current-doc))
+    (set-tab! :enhance)
+    (when-let [lid (kind-layer! :repair)]
+      (when-not (:enabled (s/layer lid))
+        (record! nil)
+        (s/edit! (cur-id) d/update-layer lid assoc :enabled true))
+      (set-tool! :paint lid))))
 
 (defn set-mode! [mode]
   (swap! s/view* assoc :mode mode)
-  (when (= :fit (:zoom @s/view*))
-    (when-let [[w h] (doc-size)] (swap! s/view* v/fit w h))))
+  (refit!))
 
 (defn zoom-fit! []
   (when-let [[w h] (doc-size)] (swap! s/view* v/fit w h)))

@@ -100,3 +100,56 @@
       (px/free-mask! mask)
       (px/free-image! base)
       (px/free-image! out))))
+
+(deftest repair
+  (let [w 300 h 200
+        spot? (fn [x y] (< (+ (Math/pow (- x 150) 2) (Math/pow (- y 100) 2)) 225))
+        base (filled w h (fn [x y] (if (spot? x y) [1 0 1] [(/ x (double w)) (/ y (double h)) 0.4])))
+        out (px/new-image w h)
+        mask (px/new-mask w h 4 0.0)]
+    (testing "nothing painted: the output is the composite below"
+      (is (= :done (eng/repair! {:base base :below [] :out out :mask mask})))
+      (is (every? true? (map #(< (Math/abs (- %1 %2)) 1e-3) [1 0 1] (px/pixel out 150 100)))))
+    (px/stroke! mask [150 100] [150 100] {:radius 20 :hardness 1.0})
+    (testing "a painted spot is filled from around it"
+      (is (= :done (eng/repair! {:base base :below [] :out out :mask mask})))
+      (let [[r g b] (px/pixel out 150 100)]
+        (is (< (Math/abs (- r 0.5)) 0.08) (str "red " r))
+        (is (< (Math/abs (- g 0.5)) 0.08) (str "green " g))
+        (is (< (Math/abs (- b 0.4)) 0.05) (str "blue " b))))
+    (testing "away from it, untouched"
+      (is (every? true? (map #(< (Math/abs (- %1 %2)) 1e-3) (px/pixel base 20 20) (px/pixel out 20 20)))))
+    (testing "cancelled between areas"
+      (is (= :cancelled (eng/repair! {:base base :below [] :out out :mask mask :cancelled? (constantly true)}))))
+    (px/free-mask! mask)
+    (doseq [i [base out]] (px/free-image! i))))
+
+(deftest incremental-repair
+  (let [w 400 h 200
+        spot? (fn [cx x y] (< (+ (Math/pow (- x cx) 2) (Math/pow (- y 100) 2)) 144))
+        base (filled w h (fn [x y] (if (or (spot? 80 x y) (spot? 200 x y) (spot? 320 x y)) [1 0 1] [(/ x (double w)) 0.4 0.4])))
+        out (px/new-image w h)
+        mask (px/new-mask w h 4 0.0)
+        paint! (fn [cx] (px/stroke! mask [cx 100] [cx 100] {:radius 18 :hardness 1.0}))
+        red #(first (px/pixel out % 100))]
+    (paint! 80) (paint! 200)
+    (eng/repair! {:base base :below [] :out out :mask mask})
+    (px/mask-take-dirty! mask)
+    (let [before (px/pixel out 80 100)]
+      (testing "a new stroke: only the repairs it touches are redone"
+        (paint! 320)
+        (let [dirty (px/mask-take-dirty! mask)]
+          (is (some? dirty))
+          (is (< 280 (first dirty) 320) (str dirty))
+          (is (= :done (eng/repair! {:base base :below [] :out out :mask mask :dirty dirty})))
+          (is (< (Math/abs (- (red 320) 0.8)) 0.1) (str "third spot " (red 320)))
+          (is (= before (px/pixel out 80 100)) "the first, untouched")))
+      (testing "nothing changed: nothing marked"
+        (is (nil? (px/mask-take-dirty! mask))))
+      (testing "restoring a spot (erasing its repair) brings the original back"
+        (px/stroke! mask [200 100] [200 100] {:radius 30 :hardness 1.0 :erase? true})
+        (eng/repair! {:base base :below [] :out out :mask mask :dirty (px/mask-take-dirty! mask)})
+        (is (< 0.95 (red 200)) (str "magenta again: " (red 200)))
+        (is (= before (px/pixel out 80 100)))))
+    (px/free-mask! mask)
+    (doseq [i [base out]] (px/free-image! i))))

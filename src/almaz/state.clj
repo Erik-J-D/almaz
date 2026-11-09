@@ -5,21 +5,29 @@
    other cells are UI state: what is selected, how it is viewed, the brush,
    and what the worker is doing."
   (:require [glimmer.ratom :as r]
-            [almaz.doc :as d])
+            [almaz.doc :as d]
+            [almaz.geom :as g])
   (:import (java.util.concurrent LinkedBlockingQueue TimeUnit)))
 
 (defonce db* (r/atom (d/empty-db)))
 (defonce current* (r/atom nil))   ; id of the doc being edited
 (defonce view* (r/atom {:mode :single :cw 800 :ch 600 :scale 0.1 :ox 0.0 :oy 0.0
                         :zoom :fit :split 0.5}))
-;; :mode :pan | :paint | :erase; :layer the layer whose mask the brush edits
+;; :mode :pan | :paint | :erase | :pick; :layer the layer whose mask the brush
+;; edits; :pick the levels point a click on the image sets (:black :grey :white)
 (defonce tool* (r/atom {:mode :pan :layer nil :radius 150.0 :hardness 0.5 :flow 1.0
-                        :show-mask true}))
+                        :show-mask true :pick nil}))
+;; the sidebar tab (:enhance :color :dimensions); on :dimensions the image
+;; pane edits the crop (the whole image shows, the crop as a frame over it)
+(defonce tab* (r/atom :enhance))
+;; doc id -> undo history (almaz.history), the last `undo-limit` edits
+(defonce history* (r/atom {}))
 (defonce job* (r/atom nil))       ; {:label :done :total} while the worker is busy
 (defonce message* (r/atom "Add images to begin"))
 (defonce autopilot* (r/atom true))
 (defonce pixels-rev* (r/atom 0))  ; native pixels changed (tiles written, masks painted)
 (defonce cursor* (r/atom nil))    ; pointer over the canvas [x y], nil outside
+(defonce space* (r/atom false))   ; Space held over the canvas: drag pans
 (defonce export-req* (atom nil))  ; {:doc :path :format :quality} for the worker
 
 ;; ---- worker wake-up ----------------------------------------------------------
@@ -40,6 +48,13 @@
 (defn current-doc [] (d/doc @db* @current*))
 (defn layers [doc-id] (d/layers @db* doc-id))
 (defn layer [id] (d/layer @db* id))
+
+(defn editing-crop? [] (= :dimensions @tab*))
+
+(defn display-size
+  "The size the image pane shows the doc at (almaz.geom), once known."
+  [doc]
+  (when (:w doc) (g/display-size doc (editing-crop?))))
 
 ;; ---- writing -----------------------------------------------------------------
 (defn swap-db!
@@ -72,6 +87,15 @@
   [id f & args]
   (swap! db* (fn [db] (if (d/doc db id)
                         (d/update-doc (apply f db args) id assoc :edited-at (now))
+                        db)))
+  (wake!))
+
+(defn edit-done!
+  "edit!, for an edit that's complete in itself (a finished brush stroke):
+   nothing more is coming, so processing needn't wait for it to settle."
+  [id f & args]
+  (swap! db* (fn [db] (if (d/doc db id)
+                        (d/update-doc (apply f db args) id assoc :edited-at 0)
                         db)))
   (wake!))
 

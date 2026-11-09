@@ -24,6 +24,14 @@
       (is (= [8280 5520] [(px/width img) (px/height img)]))
       (let [[r g b] (px/pixel img 4140 2760)]
         (is (every? #(< 0.0 % 1.0) [r g b]) "no channel clipped at the centre"))
+      (px/free-image! img)))
+  (testing "no automatic brightening: the shot keeps its exposure"
+    ;; LibRaw's auto-brightening scales every image until 1% of it clips; it
+    ;; lifted this underexposed frame by ~2.8 EV (mean luma 127 instead of 48)
+    (let [img (raw/decode nef)
+          {:keys [l]} (px/histogram img [])
+          mean (/ (reduce + (map-indexed * l)) (double (reduce + l)))]
+      (is (< 40 mean 60) (str "mean luma " mean))
       (px/free-image! img)))))
 
 (deftest embedded-thumbnail

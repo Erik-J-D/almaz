@@ -26,6 +26,7 @@ static void set_err(char **err, const char *msg) {
   if (err) *err = dupstr(msg);
 }
 void almz_free_string(char *s) { free(s); }
+int almz_abi(void) { return ALMZ_ABI; }
 
 /* ---- parallel for ------------------------------------------------------ */
 typedef void (*job_fn)(void *ctx, int i0, int i1);
@@ -66,6 +67,31 @@ static void par_range(int lo, int hi, int min_chunk, job_fn fn, void *ctx) {
 
 static void par_for(int n, int min_chunk, job_fn fn, void *ctx) { par_range(0, n, min_chunk, fn, ctx); }
 
+/* ---- revisions ---------------------------------------------------------- */
+/* GPU caches key copies by uid (pointers are reused after free) and refresh
+ * them when rev moves. */
+static uint64_t next_uid(void) {
+  static uint64_t uid = 0;
+  return __atomic_add_fetch(&uid, 1, __ATOMIC_RELAXED);
+}
+static inline void bump(uint64_t *rev) { __atomic_add_fetch(rev, 1, __ATOMIC_RELAXED); }
+
+/* the GPU side (almazimg_metal.m on macOS, stubs elsewhere) */
+int almz_gpu_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers, const double *xf,
+                    const int32_t *clip, const AlmzMask *overlay, const float *tint, uint8_t *out,
+                    int out_w, int out_h, int rx, int ry, int rw, int rh, const uint8_t *bg, int level,
+                    int nearest, int luma_alpha);
+void almz_gpu_forget(uint64_t uid);
+#ifndef __APPLE__
+int almz_gpu_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers, const double *xf,
+                    const int32_t *clip, const AlmzMask *overlay, const float *tint, uint8_t *out,
+                    int out_w, int out_h, int rx, int ry, int rw, int rh, const uint8_t *bg, int level,
+                    int nearest, int luma_alpha) { return 0; }
+void almz_gpu_forget(uint64_t uid) {}
+void almz_gpu_set_enabled(int on) {}
+int almz_gpu_active(void) { return 0; }
+#endif
+
 /* ---- images ------------------------------------------------------------ */
 static void pyr_alloc(AlmzImg *img) {
   int w = img->w, h = img->h, k = 1;
@@ -87,6 +113,7 @@ AlmzImg *almz_img_wrap(int w, int h, uint16_t *data) {
   img->w = w;
   img->h = h;
   img->lev[0] = data;
+  img->uid = next_uid();
   pyr_alloc(img);
   almz_img_pyr_update(img, 0, 0, w, h);
   return img;
@@ -99,6 +126,8 @@ AlmzImg *almz_img_new(int w, int h) {
 AlmzImg *almz_img_copy(const AlmzImg *src) {
   AlmzImg *img = (AlmzImg *)calloc(1, sizeof(AlmzImg));
   *img = *src;
+  img->uid = next_uid();
+  img->rev = 0;
   for (int k = 0; k < src->nlev; k++) {
     size_t n = (size_t)src->lw[k] * src->lh[k] * 3;
     img->lev[k] = (uint16_t *)malloc(n * sizeof(uint16_t));
@@ -109,6 +138,7 @@ AlmzImg *almz_img_copy(const AlmzImg *src) {
 
 void almz_img_free(AlmzImg *img) {
   if (!img) return;
+  almz_gpu_forget(img->uid);
   for (int k = 0; k < img->nlev; k++) free(img->lev[k]);
   free(img);
 }
@@ -133,6 +163,7 @@ static void down_rows(void *p, int y0, int y1) {
 }
 
 void almz_img_pyr_update(AlmzImg *img, int x, int y, int w, int h) {
+  bump(&img->rev);
   int x0 = MAX(0, x), y0 = MAX(0, y), x1 = MIN(img->w, x + w), y1 = MIN(img->h, y + h);
   for (int k = 1; k < img->nlev; k++) {
     x0 /= 2;
@@ -175,12 +206,14 @@ AlmzMask *almz_mask_new(int iw, int ih, int div, float value) {
   size_t n = (size_t)m->w * m->h;
   m->paint = (float *)malloc(n * sizeof(float));
   m->soft = (float *)malloc(n * sizeof(float));
+  m->uid = next_uid();
   almz_mask_fill(m, value);
   return m;
 }
 
 void almz_mask_free(AlmzMask *m) {
   if (!m) return;
+  almz_gpu_forget(m->uid);
   free(m->paint);
   free(m->soft);
   free(m);
@@ -188,7 +221,39 @@ void almz_mask_free(AlmzMask *m) {
 
 /* Recompute `soft` over the mask rectangle [x0,x1) x [y0,y1): a separable
  * gaussian of `paint` (edges clamped). */
+/* ---- what changed (for incremental repairs) ---- */
+static pthread_mutex_t dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* mark the image rect [x0, x1) x [y0, y1) changed */
+static void mark_dirty(AlmzMask *m, int x0, int y0, int x1, int y1) {
+  x0 = MAX(0, x0), y0 = MAX(0, y0), x1 = MIN(m->iw, x1), y1 = MIN(m->ih, y1);
+  if (x1 <= x0 || y1 <= y0) return;
+  pthread_mutex_lock(&dirty_lock);
+  if (m->dirty) {
+    m->dx0 = MIN(m->dx0, x0), m->dy0 = MIN(m->dy0, y0), m->dx1 = MAX(m->dx1, x1), m->dy1 = MAX(m->dy1, y1);
+  } else {
+    m->dirty = 1, m->dx0 = x0, m->dy0 = y0, m->dx1 = x1, m->dy1 = y1;
+  }
+  pthread_mutex_unlock(&dirty_lock);
+}
+
+static void mark_all(AlmzMask *m) { mark_dirty(m, 0, 0, m->iw, m->ih); }
+
+int almz_mask_take_dirty(AlmzMask *m, int32_t *r) {
+  pthread_mutex_lock(&dirty_lock);
+  const int d = m->dirty;
+  if (d) r[0] = m->dx0, r[1] = m->dy0, r[2] = m->dx1 - m->dx0, r[3] = m->dy1 - m->dy0;
+  m->dirty = 0;
+  pthread_mutex_unlock(&dirty_lock);
+  return d;
+}
+
+void almz_mask_add_dirty(AlmzMask *m, int x, int y, int w, int h) { mark_dirty(m, x, y, x + w, y + h); }
+
 static void soft_update(AlmzMask *m, int x0, int y0, int x1, int y1) {
+  bump(&m->rev);
+  /* the cells redone, as image px (a cell spans div of them) */
+  mark_dirty(m, MAX(0, x0) * m->div, MAX(0, y0) * m->div, (x1 + 1) * m->div, (y1 + 1) * m->div);
   x0 = MAX(0, x0);
   y0 = MAX(0, y0);
   x1 = MIN(m->w, x1);
@@ -232,9 +297,50 @@ static void soft_update(AlmzMask *m, int x0, int y0, int x1, int y1) {
   free(k);
 }
 
+AlmzMask *almz_mask_copy(const AlmzMask *m) {
+  AlmzMask *c = (AlmzMask *)calloc(1, sizeof(AlmzMask));
+  const size_t n = (size_t)m->w * m->h;
+  if (!c) return NULL;
+  *c = *m;
+  c->paint = (float *)malloc(n * sizeof(float));
+  c->soft = (float *)malloc(n * sizeof(float));
+  if (!c->paint || !c->soft) {
+    free(c->paint);
+    free(c->soft);
+    free(c);
+    return NULL;
+  }
+  memcpy(c->paint, m->paint, n * sizeof(float));
+  memcpy(c->soft, m->soft, n * sizeof(float));
+  c->uid = next_uid();
+  c->rev = 0;
+  c->dirty = 0;
+  return c;
+}
+
+int almz_mask_restore(AlmzMask *dst, const AlmzMask *src) {
+  if (dst->w != src->w || dst->h != src->h) return -1;
+  const size_t n = (size_t)dst->w * dst->h;
+  /* mark only where it differs (an undone stroke is usually small) */
+  int x0 = dst->w, y0 = dst->h, x1 = -1, y1 = -1;
+  for (int y = 0; y < dst->h; y++)
+    for (int x = 0; x < dst->w; x++) {
+      const size_t i = (size_t)y * dst->w + x;
+      if (dst->soft[i] != src->soft[i]) x0 = MIN(x0, x), y0 = MIN(y0, y), x1 = MAX(x1, x), y1 = MAX(y1, y);
+    }
+  memcpy(dst->paint, src->paint, n * sizeof(float));
+  memcpy(dst->soft, src->soft, n * sizeof(float));
+  dst->feather = src->feather;
+  bump(&dst->rev);
+  if (x1 >= 0) mark_dirty(dst, x0 * dst->div, y0 * dst->div, (x1 + 1) * dst->div, (y1 + 1) * dst->div);
+  return 0;
+}
+
 void almz_mask_fill(AlmzMask *m, float v) {
   size_t n = (size_t)m->w * m->h;
   for (size_t i = 0; i < n; i++) m->paint[i] = m->soft[i] = v;
+  bump(&m->rev);
+  mark_all(m);
 }
 
 void almz_mask_invert(AlmzMask *m) {
@@ -327,6 +433,96 @@ static inline void sample(const AlmzImg *img, int k, float lx, float ly, int nea
     c[ch] = (a[ch] * (1 - fx) + b[ch] * fx) * (1 - fy) + (e[ch] * (1 - fx) + f[ch] * fx) * fy;
 }
 
+/* ---- light adjustments -------------------------------------------------- */
+static inline float srgb_to_lin(float v) {
+  return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
+}
+static inline float lin_to_srgb(float v) {
+  return v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
+
+/* The tone curve on an sRGB value. Each step maps 0..1 onto itself and is
+ * increasing, so the whole curve is: exposure (linear light, clipped), the
+ * white and black points, shadows and highlights (bumps that vanish at both
+ * ends, peaking at 1/3 and 2/3, scaled to stay increasing), then contrast
+ * (a power S-curve about the middle). */
+static float tone_curve(float x, const AlmzTone *t) {
+  if (t->exposure != 0.0f) x = lin_to_srgb(MIN(srgb_to_lin(x) * exp2f(t->exposure), 1.0f));
+  const float wp = 1.0f - 0.25f * t->whites, bp = -0.1f * t->blacks;
+  x = CLAMP((x - bp) / (wp - bp), 0.0f, 1.0f);
+  x += 0.9f * t->shadows * x * (1.0f - x) * (1.0f - x);
+  x += 0.9f * t->highlights * x * x * (1.0f - x);
+  if (t->contrast != 0.0f) {
+    const float g = exp2f(t->contrast);
+    x = x < 0.5f ? 0.5f * powf(2.0f * x, g) : 1.0f - 0.5f * powf(2.0f * (1.0f - x), g);
+  }
+  return CLAMP(x, 0.0f, 1.0f);
+}
+
+void almz_tone_lut(const AlmzTone *t, float *lut) {
+  for (int i = 0; i < ALMZ_TONE_N; i++) lut[i] = tone_curve((float)i / (ALMZ_TONE_N - 1), t);
+}
+
+/* lut applied to a 0..65535 value */
+static inline float lut_at(const float *lut, float v) {
+  const float f = CLAMP(v / 65535.0f, 0.0f, 1.0f) * (ALMZ_TONE_N - 1);
+  const int i = MIN((int)f, ALMZ_TONE_N - 2);
+  const float fr = f - i;
+  return (lut[i] + (lut[i + 1] - lut[i]) * fr) * 65535.0f;
+}
+
+/* curve each channel of c (0..65535) by its own lut (`stride` floats apart;
+ * 0: one shared curve), then scale the colour about its luma */
+static inline void tone_px(const float *lut, int stride, float sat, const float *c, float *o) {
+  for (int ch = 0; ch < 3; ch++) o[ch] = lut ? lut_at(lut + ch * stride, c[ch]) : c[ch];
+  if (sat != 0.0f) {
+    const float l = 0.2126f * o[0] + 0.7152f * o[1] + 0.0722f * o[2];
+    for (int ch = 0; ch < 3; ch++) o[ch] = CLAMP(l + (o[ch] - l) * (1.0f + sat), 0.0f, 65535.0f);
+  }
+}
+
+void almz_tone_apply(const AlmzTone *t, float *rgb) {
+  float lut[ALMZ_TONE_N], c[3], o[3];
+  almz_tone_lut(t, lut);
+  for (int ch = 0; ch < 3; ch++) c[ch] = rgb[ch] * 65535.0f;
+  tone_px(lut, 0, t->saturation, c, o);
+  for (int ch = 0; ch < 3; ch++) rgb[ch] = o[ch] / 65535.0f;
+}
+
+/* The cube (n^3 RGB triples, r fastest) at c (0..65535), trilinear. */
+static inline void cube_px(const float *cube, int n, const float *c, float *o) {
+  float f[3];
+  int i[3];
+  for (int k = 0; k < 3; k++) {
+    const float v = CLAMP(c[k] / 65535.0f, 0.0f, 1.0f) * (n - 1);
+    i[k] = MIN((int)v, n - 2);
+    f[k] = v - i[k];
+  }
+  const size_t sr = 3, sg = (size_t)3 * n, sb = (size_t)3 * n * n;
+  const float *p = cube + i[0] * sr + i[1] * sg + i[2] * sb;
+  for (int k = 0; k < 3; k++) {
+    const float c00 = p[k] + (p[sr + k] - p[k]) * f[0];
+    const float c10 = p[sg + k] + (p[sg + sr + k] - p[sg + k]) * f[0];
+    const float c01 = p[sb + k] + (p[sb + sr + k] - p[sb + k]) * f[0];
+    const float c11 = p[sb + sg + k] + (p[sb + sg + sr + k] - p[sb + sg + k]) * f[0];
+    const float c0 = c00 + (c10 - c00) * f[1], c1 = c01 + (c11 - c01) * f[1];
+    o[k] = CLAMP(c0 + (c1 - c0) * f[2], 0.0f, 1.0f) * 65535.0f;
+  }
+}
+
+/* darktable vignette's weight at (ix, iy): 0 inside `inner` radii, a raised
+ * cosine up to 1 at inner + falloff. */
+static inline float radial_at(const float *r, float ix, float iy) {
+  if (r[2] <= 0.0f) return 1.0f;
+  const float dx = (ix - r[0]) / r[2], dy = (iy - r[1]) / r[3];
+  const float d = sqrtf(dx * dx + dy * dy);
+  if (d <= r[4]) return 0.0f;
+  const float t = (d - r[4]) / MAX(r[5], 1e-4f);
+  return t >= 1.0f ? 1.0f : 0.5f - 0.5f * cosf((float)M_PI * t);
+}
+
+static inline int is_adjust(const AlmzLayer *L) { return L->lut || L->cube || L->saturation != 0.0f; }
+
 /* Composite at level-0 image coordinates (ix, iy) using pyramid level k. */
 static inline void composite_at(const AlmzImg *base, const AlmzLayer *layers, int n, int k,
                                 float ix, float iy, int nearest, float *c) {
@@ -335,12 +531,20 @@ static inline void composite_at(const AlmzImg *base, const AlmzLayer *layers, in
   sample(base, k, lx, ly, nearest, c);
   for (int i = 0; i < n; i++) {
     const AlmzLayer *L = &layers[i];
-    if (!L->enabled || !L->img || L->opacity <= 0) continue;
+    if (!L->enabled || !(L->img || is_adjust(L)) || L->opacity <= 0) continue;
     float a = L->opacity;
     if (L->mask) a *= mask_at(L->mask, ix / L->mask->div - 0.5f, iy / L->mask->div - 0.5f);
+    if (!L->img) a *= radial_at(L->radial, ix, iy);
     if (a <= 0) continue;
     float l[3];
-    sample(L->img, MIN(k, L->img->nlev - 1), lx, ly, nearest, l);
+    if (!L->img) {
+      tone_px(L->lut, ALMZ_TONE_N, L->saturation, c, l);
+      if (L->cube && L->cube_n >= 2) {
+        float t[3] = {l[0], l[1], l[2]};
+        cube_px(L->cube, L->cube_n, t, l);
+      }
+    } else
+      sample(L->img, MIN(k, L->img->nlev - 1), lx, ly, nearest, l);
     c[0] += (l[0] - c[0]) * a;
     c[1] += (l[1] - c[1]) * a;
     c[2] += (l[2] - c[2]) * a;
@@ -351,7 +555,8 @@ typedef struct {
   const AlmzImg *base;
   const AlmzLayer *layers;
   int n, k, nearest;
-  double ox, oy, scale;
+  double xf[6];
+  float cx0, cy0, cx1, cy1;
   const AlmzMask *overlay;
   float tint[4];
   uint8_t *out;
@@ -361,13 +566,13 @@ typedef struct {
 
 static void render_rows(void *p, int y0, int y1) {
   const render_ctx *c = (const render_ctx *)p;
-  const int W = c->base->w, H = c->base->h;
+  const double *m = c->xf;
   for (int sy = y0; sy < y1; sy++) {
     uint8_t *o = c->out + ((size_t)sy * c->out_w + c->rx) * 4;
-    const float iy = (float)((sy + 0.5 - c->oy) / c->scale);
     for (int sx = c->rx; sx < c->rx + c->rw; sx++, o += 4) {
-      const float ix = (float)((sx + 0.5 - c->ox) / c->scale);
-      if (ix < 0 || iy < 0 || ix >= W || iy >= H) {
+      const float ix = (float)(m[0] * (sx + 0.5) + m[1] * (sy + 0.5) + m[2]);
+      const float iy = (float)(m[3] * (sx + 0.5) + m[4] * (sy + 0.5) + m[5]);
+      if (ix < c->cx0 || iy < c->cy0 || ix >= c->cx1 || iy >= c->cy1) {
         memcpy(o, c->bg, 4);
         continue;
       }
@@ -385,8 +590,19 @@ static void render_rows(void *p, int y0, int y1) {
   }
 }
 
+/* clip (NULL: the whole image) as [x0, x1) x [y0, y1) */
+static void clip_bounds(const AlmzImg *base, const int32_t *clip, float *b) {
+  b[0] = 0; b[1] = 0; b[2] = (float)base->w; b[3] = (float)base->h;
+  if (clip) {
+    b[0] = MAX(0.0f, (float)clip[0]);
+    b[1] = MAX(0.0f, (float)clip[1]);
+    b[2] = MIN((float)base->w, (float)(clip[0] + clip[2]));
+    b[3] = MIN((float)base->h, (float)(clip[1] + clip[3]));
+  }
+}
+
 void almz_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
-                 double ox, double oy, double scale,
+                 const double *xf, const int32_t *clip,
                  const AlmzMask *overlay, const float *tint,
                  uint8_t *out, int out_w, int out_h,
                  int rx, int ry, int rw, int rh, const uint8_t *bg) {
@@ -394,15 +610,116 @@ void almz_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
   ry = MAX(0, ry);
   rw = MIN(rw, out_w - rx);
   rh = MIN(rh, out_h - ry);
-  if (rw <= 0 || rh <= 0 || scale <= 0) return;
+  const double det = fabs(xf[0] * xf[4] - xf[1] * xf[3]);
+  if (rw <= 0 || rh <= 0 || det <= 0) return;
+  const double scale = 1.0 / sqrt(det); /* screen px per source px */
   /* the finest level with at most ~1 source pixel per screen pixel */
   int k = 0;
   while (k + 1 < base->nlev && scale * (1 << (k + 1)) <= 1.0) k++;
-  render_ctx c = {base, layers, nlayers, k, scale >= 2.0, ox, oy, scale, overlay,
+  if (almz_gpu_render(base, layers, nlayers, xf, clip, overlay, tint, out, out_w, out_h, rx, ry, rw, rh, bg,
+                      k, scale >= 2.0, 0))
+    return;
+  float b[4];
+  clip_bounds(base, clip, b);
+  render_ctx c = {base, layers, nlayers, k, scale >= 2.0,
+                  {xf[0], xf[1], xf[2], xf[3], xf[4], xf[5]}, b[0], b[1], b[2], b[3], overlay,
                   {0, 0, 0, 0}, out, out_w, rx, rw, {0, 0, 0, 255}};
   if (tint) memcpy(c.tint, tint, sizeof(c.tint));
   if (bg) memcpy(c.bg, bg, 4);
   par_range(ry, ry + rh, 8, render_rows, &c);
+}
+
+/* ---- histogram ---------------------------------------------------------- */
+typedef struct {
+  const AlmzImg *base;
+  const AlmzLayer *layers;
+  int n, k, x0, x1;
+  uint32_t *out;
+} hist_ctx;
+
+static inline int bin8(float v) { return CLAMP((int)(v / 257.0f + 0.5f), 0, 255); }
+
+static void hist_rows(void *p, int y0, int y1) {
+  const hist_ctx *c = (const hist_ctx *)p;
+  uint32_t h[4 * 256] = {0};
+  const float s = (float)(1 << c->k);
+  for (int y = y0; y < y1; y++)
+    for (int x = c->x0; x < c->x1; x++) {
+      float v[3];
+      composite_at(c->base, c->layers, c->n, c->k, (x + 0.5f) * s, (y + 0.5f) * s, 1, v);
+      h[bin8(v[0])]++;
+      h[256 + bin8(v[1])]++;
+      h[512 + bin8(v[2])]++;
+      h[768 + bin8(0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2])]++;
+    }
+  for (int i = 0; i < 4 * 256; i++)
+    if (h[i]) __atomic_fetch_add(&c->out[i], h[i], __ATOMIC_RELAXED);
+}
+
+void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int n,
+                    const int32_t *clip, uint32_t *out) {
+  memset(out, 0, 4 * 256 * sizeof(uint32_t));
+  float b[4];
+  clip_bounds(base, clip, b);
+  int k = 0;
+  while (k + 1 < base->nlev && (double)(b[2] - b[0]) * (b[3] - b[1]) / ((size_t)1 << (2 * k)) > 1500000) k++;
+  const float s = (float)(1 << k);
+  /* the level-k pixels whose centres fall inside the clip */
+  const int x0 = (int)ceilf(b[0] / s - 0.5f), x1 = MIN(base->lw[k], (int)ceilf(b[2] / s - 0.5f));
+  const int y0 = (int)ceilf(b[1] / s - 0.5f), y1 = MIN(base->lh[k], (int)ceilf(b[3] / s - 0.5f));
+  if (x1 <= x0 || y1 <= y0) return;
+  /* on the GPU: the level-k pixels drawn 1:1 (nearest, as below), each
+   * pixel's luma bin in its alpha, then counted here */
+  const int hw = x1 - x0, hh = y1 - y0;
+  uint8_t *px = (uint8_t *)malloc((size_t)hw * hh * 4);
+  const double gxf[6] = {s, 0, x0 * s, 0, s, y0 * s};
+  if (px && almz_gpu_render(base, layers, n, gxf, clip, NULL, NULL, px, hw, hh, 0, 0, hw, hh, NULL, k, 1, 1)) {
+    for (size_t i = 0; i < (size_t)hw * hh; i++) {
+      const uint8_t *q = px + i * 4;
+      out[q[0]]++;
+      out[256 + q[1]]++;
+      out[512 + q[2]]++;
+      out[768 + q[3]]++;
+    }
+    free(px);
+    return;
+  }
+  free(px);
+  hist_ctx c = {base, layers, n, k, x0, x1, out};
+  par_range(y0, y1, 16, hist_rows, &c);
+}
+
+void almz_histogram_draw(const uint32_t *hist, int w, int h, uint8_t *out, const uint8_t *bg) {
+  /* scale to the tallest bin, leaving out the end bins (clipped shadows and
+   * highlights pile up there and would flatten everything else) */
+  uint32_t top = 1;
+  for (int ch = 0; ch < 3; ch++)
+    for (int i = 1; i < 255; i++) top = MAX(top, hist[ch * 256 + i]);
+  static const float rgb[3][3] = {{0.95f, 0.30f, 0.30f}, {0.30f, 0.85f, 0.35f}, {0.35f, 0.50f, 1.0f}};
+  for (int x = 0; x < w; x++) {
+    const float f = (x + 0.5f) * 256.0f / w;
+    const int i = MIN((int)f, 255);
+    float bar[3];
+    for (int ch = 0; ch < 3; ch++) bar[ch] = MIN(1.0f, (float)hist[ch * 256 + i] / top) * h;
+    for (int y = 0; y < h; y++) {
+      const float up = (float)(h - y) - 0.5f; /* height above the bottom */
+      float col[3] = {0, 0, 0};
+      int any = 0;
+      for (int ch = 0; ch < 3; ch++)
+        if (bar[ch] > up) {
+          any = 1;
+          for (int q = 0; q < 3; q++) col[q] += rgb[ch][q];
+        }
+      uint8_t *o = out + ((size_t)y * w + x) * 4;
+      if (any) {
+        for (int q = 0; q < 3; q++)
+          o[q] = (uint8_t)CLAMP((int)(bg[q] * 0.3f + MIN(col[q], 1.0f) * 0.7f * 255.0f), 0, 255);
+        o[3] = 255;
+      } else {
+        memcpy(o, bg, 4);
+      }
+    }
+  }
 }
 
 /* ---- tiles ------------------------------------------------------------- */
@@ -754,11 +1071,16 @@ AlmzImg *almz_load(const char *path, char **err) {
   return img;
 }
 
-/* composite one full-resolution row into u16 RGB */
-static void composite_row(const AlmzImg *base, const AlmzLayer *layers, int n, int y, uint16_t *row) {
-  for (int x = 0; x < base->w; x++) {
+static const double xf_identity[6] = {1, 0, 0, 0, 1, 0};
+
+/* composite one full-resolution output row (w pixels; xf: output -> source) */
+static void composite_row(const AlmzImg *base, const AlmzLayer *layers, int n, const double *m,
+                          int w, int y, uint16_t *row) {
+  for (int x = 0; x < w; x++) {
     float v[3];
-    composite_at(base, layers, n, 0, x + 0.5f, y + 0.5f, 1, v);
+    const double ox = x + 0.5, oy = y + 0.5;
+    const float ix = (float)(m[0] * ox + m[1] * oy + m[2]), iy = (float)(m[3] * ox + m[4] * oy + m[5]);
+    composite_at(base, layers, n, 0, ix, iy, 1, v);
     for (int c = 0; c < 3; c++) row[x * 3 + c] = (uint16_t)CLAMP((int)(v[c] + 0.5f), 0, 65535);
   }
 }
@@ -768,7 +1090,7 @@ typedef struct { AlmzImg *dst; const AlmzImg *base; const AlmzLayer *layers; int
 static void comp_rows(void *p, int y0, int y1) {
   const comp_ctx *c = (const comp_ctx *)p;
   for (int y = y0; y < y1; y++)
-    composite_row(c->base, c->layers, c->n, y, c->dst->lev[0] + (size_t)y * c->dst->w * 3);
+    composite_row(c->base, c->layers, c->n, xf_identity, c->base->w, y, c->dst->lev[0] + (size_t)y * c->dst->w * 3);
 }
 
 void almz_composite_into(AlmzImg *dst, const AlmzImg *base, const AlmzLayer *layers, int n) {
@@ -776,6 +1098,32 @@ void almz_composite_into(AlmzImg *dst, const AlmzImg *base, const AlmzLayer *lay
   comp_ctx c = {dst, base, layers, n};
   par_for(base->h, 16, comp_rows, &c);
   almz_img_pyr_update(dst, 0, 0, dst->w, dst->h);
+}
+
+/* Rows of the full-resolution composite for the writers, made a band at a
+ * time across all cores (the encoders themselves are serial). */
+enum { BAND_ROWS = 64 };
+typedef struct {
+  const AlmzImg *base;
+  const AlmzLayer *layers;
+  int n, y0;   /* first row in buf, -1 when empty */
+  const double *xf;
+  int w, h;    /* output size */
+  uint16_t *buf;
+} row_src;
+
+static void band_rows(void *p, int r0, int r1) {
+  row_src *s = (row_src *)p;
+  for (int r = r0; r < r1; r++)
+    composite_row(s->base, s->layers, s->n, s->xf, s->w, s->y0 + r, s->buf + (size_t)r * s->w * 3);
+}
+
+static uint16_t *row_at(row_src *s, int y) {
+  if (s->y0 < 0 || y < s->y0 || y >= s->y0 + BAND_ROWS) {
+    s->y0 = y - y % BAND_ROWS;
+    par_for(MIN(BAND_ROWS, s->h - s->y0), 1, band_rows, s);
+  }
+  return s->buf + (size_t)(y - s->y0) * s->w * 3;
 }
 
 /* TIFF: the camera fields as real tags, the EXIF ones in an EXIF directory. */
@@ -813,11 +1161,18 @@ static int tiff_exif_dir(TIFF *t, const AlmzMeta *m) {
 }
 
 int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
+              const double *xf, int out_w, int out_h,
               const char *path, int format, int quality, const AlmzMeta *meta, char **err) {
-  const int w = base->w, h = base->h;
+  if (!xf || out_w <= 0 || out_h <= 0) {
+    xf = xf_identity;
+    out_w = base->w;
+    out_h = base->h;
+  }
+  const int w = out_w, h = out_h;
   uint8_t *exif = NULL;
   const size_t exif_len = meta ? almz_exif_build(meta, &exif) : 0;
-  uint16_t *row = (uint16_t *)malloc((size_t)w * 3 * sizeof(uint16_t));
+  row_src src = {base, layers, n, -1, xf, w, h, (uint16_t *)malloc((size_t)w * 3 * BAND_ROWS * sizeof(uint16_t))};
+  uint16_t *row;
   uint8_t *row8 = (uint8_t *)malloc((size_t)w * 3);
   int rc = 0;
   if (format == ALMZ_FMT_JPEG) {
@@ -851,7 +1206,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
       free(app1);
     }
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       for (int i = 0; i < w * 3; i++) row8[i] = (uint8_t)((row[i] + 128) / 257);
       JSAMPROW r = row8;
       jpeg_write_scanlines(&ci, &r, 1);
@@ -873,6 +1228,9 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     }
     png_init_io(p, f);
     const int bits = format == ALMZ_FMT_PNG16 ? 16 : 8;
+    /* zlib's effort barely pays on photographs (16-bit: level 1 is half the
+     * time of the default for ~2% more bytes) */
+    png_set_compression_level(p, bits == 16 ? 1 : 3);
     png_set_IHDR(p, info, w, h, bits, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
     if (exif_len) png_set_eXIf_1(p, info, (png_uint_32)exif_len, exif);
@@ -881,7 +1239,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     if (bits == 16) png_set_swap(p);
 #endif
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       if (bits == 16)
         png_write_row(p, (png_bytep)row);
       else {
@@ -907,7 +1265,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     if (meta) tiff_main_tags(t, meta);
     if (with_exif) TIFFSetField(t, TIFFTAG_EXIFIFD, (uint64_t)0); /* placeholder, patched below */
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       if (TIFFWriteScanline(t, row, y, 0) < 0) {
         set_err(err, "TIFF write failed");
         rc = -1;
@@ -924,7 +1282,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     rc = -1;
   }
 done:
-  free(row);
+  free(src.buf);
   free(row8);
   free(exif);
   return rc;

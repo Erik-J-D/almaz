@@ -49,9 +49,11 @@
 (def mask-div "Masks are stored at 1/4 of the image resolution." 4)
 
 (defn new-mask
-  "A full (everywhere) mask for a w x h image with the given feather."
-  [w h feather]
-  (doto (px/new-mask w h mask-div 1.0) (px/mask-feather! feather)))
+  "A mask for a w x h image with the given feather, filled with `fill`
+   (1: everywhere, the default; 0: nowhere, for repairs)."
+  ([w h feather] (new-mask w h feather 1.0))
+  ([w h feather fill]
+   (doto (px/new-mask w h mask-div fill) (px/mask-feather! feather))))
 
 (defn- install-mask!
   "Give layer `lid` the mask `m` unless it already has one (or is gone);
@@ -68,15 +70,15 @@
   (let [{:keys [w h]} (s/doc doc-id)]
     (when w
       (doseq [l (s/layers doc-id) :when (nil? (:mask l))]
-        (install-mask! (:id l) (new-mask w h (:feather l)))))))
+        (install-mask! (:id l) (new-mask w h (:feather l) (d/mask-fill l)))))))
 
 (defn with-autopilot
   "Add the layers autopilot suggests for the doc's estimate, at the suggested
    strengths, and remember it ran."
   [db doc-id]
   (reduce (fn [acc {:keys [kind opacity]}]
-            (let [[acc' lid] (d/add-layer acc doc-id kind)]
-              (d/update-layer acc' lid assoc :opacity opacity)))
+            (let [[acc' lid] (d/ensure-layer acc doc-id kind)]
+              (d/update-layer acc' lid assoc :opacity opacity :enabled true)))
           (d/update-doc db doc-id assoc :autopiloted true)
           (ap/suggest (d/estimate (d/doc db doc-id)))))
 

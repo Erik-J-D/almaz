@@ -12,8 +12,7 @@
                             :git/sha "09b8ab08705fa1e6f20145c2e99eaaba9ea812cc"}
         ;; BUI (Blender-look) backend; GPL-2.0+
         jlt-commons/glimmer-bui {:git/url "https://github.com/jlt-commons/glimmer-bui"
-                                 :git/tag "v0.1.0"
-                                 :git/sha "1068e9eef6c6c7bba782cff025314037edd665ff"}
+                                 :git/sha "d54dd02b4a859864ead02a527e2d765682ff8533"}
         ;; in-memory relational store: the document/layer data model
         yogthos/relatum {:git/url "https://github.com/yogthos/relatum"
                          :git/tag "v0.3.0"
@@ -49,6 +48,7 @@
            :test  {:extra-paths ["test"] :main-opts ["-m" "almaz.test-runner"]}}
 
  :tasks {dist  {:doc "package target/Almaz.app (macOS arm64)" :task (shell "jolt" "native/tools/package_macos.clj")}
-         run   "jolt -M:run"
+         ;; `run` is also a jolt built-in; this one is the app
+         run   {:doc "the app" :task (jolt "-M:run") :override-builtin true}
          check "jolt -M:check"
          test  "jolt -M:test"}}

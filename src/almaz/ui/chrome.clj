@@ -3,8 +3,9 @@
    status bar (progress, size, zoom) and the filmstrip."
   (:require [almaz.actions :as act]
             [almaz.doc :as d]
+            [almaz.geom :as g]
             [almaz.state :as s]
-            [almaz.worker :as worker]
+            [almaz.loading :as load]
             [almaz.ui.units :refer [px]]
             [almaz.view :as v]))
 
@@ -25,6 +26,12 @@
              :value (case mode :split 1 :side 2 0)
              :on-change #(act/set-mode! ([:single :split :side] (long %)))}]
      [:label {:text "" :weight 1}]
+     (let [_ @s/history* _ @s/current*]
+       [:hbox {:weight 0 :spacing 2}
+        [:button {:text "Undo" :icon "LOOP_BACK" :enabled (if (act/can-undo?) 1 0) :on-click act/undo!
+                  :description "Undo (Cmd+Z)"}]
+        [:button {:text "Redo" :icon "LOOP_FORWARDS" :enabled (if (act/can-redo?) 1 0) :on-click act/redo!
+                  :description "Redo (Shift+Cmd+Z)"}]])
      [:label {:text (str "v" version) :weight 0}]
      [:dropdown {:items (mapv first act/export-formats) :weight 0 :value @export-format
                  :on-change #(reset! export-format (long %))}]
@@ -61,13 +68,14 @@
                :on-click #(some-> @s/current* act/remove-doc!)}]
      [:label {:text @s/message* :weight 1}]
      (when job (job-progress job))
-     (when (:w doc) [:label {:text (str "W " (:w doc) "  H " (:h doc)) :weight 0}])
+     (when-let [[w h] (when (:w doc) (g/display-size doc false))]
+       [:label {:text (str "W " w "  H " h) :weight 0}])
      [:label {:text (v/zoom-label view) :weight 0}]
      (zoom-menu view)]))
 
 (defn- thumb [id selected?]
   (let [{ptr :thumb rev :thumb-rev :keys [name status]} (s/doc id)
-        [w h] worker/thumb-size
+        [w h] load/thumb-size
         [tw th] [(px 88) (px 59)]]
     [:vbox {:key id :weight 0 :spacing 2}
      [:canvas {:reqwidth tw :reqheight th :events 1

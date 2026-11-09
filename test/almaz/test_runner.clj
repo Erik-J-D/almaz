@@ -4,11 +4,11 @@
    exported (README). Exits non-zero on any failure, error or load error."
   (:require [clojure.test :as t]))
 
-(def pure '[almaz.tile-test almaz.view-test almaz.doc-test almaz.autopilot-test
+(def pure '[almaz.tile-test almaz.view-test almaz.doc-test almaz.autopilot-test almaz.geom-test almaz.color-test almaz.history-test
             almaz.ep-test])
 
 (def native '[almaz.download-test almaz.pixels-test almaz.raw-test almaz.ort-test almaz.coreml-test
-              almaz.engine-test almaz.cli-test])
+              almaz.engine-test almaz.cli-test almaz.worker-test])
 
 (defmethod t/report :error [m]
   (t/with-test-out

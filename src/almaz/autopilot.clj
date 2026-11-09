@@ -31,3 +31,27 @@
 
 (defn describe [{:keys [noise sharpness]}]
   (format "noise %.1f%%  sharpness %.2f" (* 100.0 noise) (double sharpness)))
+
+;; ---- exposure ------------------------------------------------------------------
+(def ^:private clip-fraction "The share of pixels auto exposure lets reach white." 0.01)
+(def ^:private max-ev 5.0)
+
+(defn- srgb->linear [v]
+  (if (<= v 0.04045) (/ v 12.92) (Math/pow (/ (+ v 0.055) 1.055) 2.4)))
+
+(defn auto-exposure
+  "The exposure (EV) that lifts an image until its brightest 1% reaches
+   white, from its 256-bin luma histogram: what raw converters do by
+   default, offered on request. Never darkens; at most +5 EV."
+  [luma]
+  (let [total (reduce + luma)]
+    (if (zero? total)
+      0.0
+      ;; the bin where the brightest 1% begins
+      (let [top (loop [i 255 acc 0]
+                  (let [acc (+ acc (nth luma i))]
+                    (if (or (zero? i) (>= acc (* clip-fraction total))) i (recur (dec i) acc))))
+            lin (srgb->linear (/ (+ top 0.5) 256.0))]
+        (if (>= top 254)
+          0.0
+          (/ (Math/round (* 100.0 (min max-ev (- (/ (Math/log lin) (Math/log 2.0)))))) 100.0))))))

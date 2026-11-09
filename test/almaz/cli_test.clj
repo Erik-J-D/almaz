@@ -92,3 +92,40 @@
         (let [r (batch/run-batch! (cli/parse ["--override" "--sharpen" "model=classic" "-o" dir
                                         (str dir "/nope.png") src]))]
           (is (= {:ok 1 :failed 1} (select-keys r [:ok :failed]))))))))
+
+(deftest light-adjustments
+  (testing "--light takes the adjustments: exposure in EV (or auto), the rest -100..100"
+    (let [o (cli/parse ["--light" "exposure=1.5" "contrast=20" "saturation=-10" "a.NEF"])]
+      (is (= {:light {:exposure 1.5 :contrast 20.0 :saturation -10.0}} (:filters o)))
+      (is (empty? (:errors o))))
+    (is (= {:light {:exposure :auto}} (:filters (cli/parse ["--light" "exposure=auto" "a.NEF"]))))
+    (is (seq (:errors (cli/parse ["--light" "exposure=bright" "a.NEF"]))))
+    (is (seq (:errors (cli/parse ["--light" "exposure=7" "a.NEF"]))) "exposure is -5..5")
+    (is (seq (:errors (cli/parse ["--light" "contrast=150" "a.NEF"]))) "the rest is -100..100"))
+  (testing "never applied unless asked for, autopilot or not"
+    (is (not-any? #(= :light (:kind %)) (cli/plan {:filters {}} noisy-soft))))
+  (testing "it goes on top, neutral where not given"
+    (let [ls (cli/plan {:filters {:light {:exposure 1.5 :contrast 20.0}}} noisy-soft)
+          l (last ls)]
+      (is (= [:denoise :sharpen :light] (mapv :kind ls)))
+      (is (= 1.5 (:exposure l)))
+      (is (= 0.2 (:contrast l)))
+      (is (= 0.0 (:shadows l)))
+      (is (= 1.0 (:opacity l)))))
+  (testing "--showSettings says what it does"
+    (is (re-find #"light .*exposure \+1.5" (cli/describe "a.NEF" noisy-soft
+                                                         (cli/plan {:override true :filters {:light {:exposure 1.5}}} noisy-soft)))))
+  (testing "end to end: brightens the result; exposure=auto measures the image"
+    (let [dir (str (or (System/getenv "TMPDIR") "/tmp/") "almaz-light-" (System/nanoTime))
+          src (str dir "/in.png")
+          img (px/new-image 16 16)]
+      (.mkdirs (java.io.File. dir))
+      (px/set-pixels! img (float-array (* 16 16 3) 0.1))
+      (px/save-image! img [] {:path src :format :png16 :quality 90})
+      (px/free-image! img)
+      (doseq [[ev expect] [["1" #(< 0.13 % 0.2)] ["auto" #(< 0.55 % 0.65)]]]
+        (is (= 1 (:ok (batch/run-batch! (cli/parse ["--override" "--light" (str "exposure=" ev)
+                                                    "--format" "png" "-o" dir src])))))
+        (let [out (px/load-image (str dir "/in-almaz.png"))]
+          (is (expect (first (px/pixel out 8 8))) ev)
+          (px/free-image! out))))))

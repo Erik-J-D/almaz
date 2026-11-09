@@ -2,9 +2,12 @@
   "The document model, held in a relatum database (passed in, returned new).
 
    A document is one image; its filter layers reference it (deleting the
-   document deletes them). Each layer runs its filter over the composite of
-   the layers below it and blends its result back over that composite through
-   its mask and opacity, the way photo editors stack adjustment layers:
+   document deletes them). There is at most one layer of each kind, at a
+   fixed place in the pipeline (`kinds`), created the first time it is
+   switched on and switched off rather than removed. Each layer runs its
+   filter over the composite of the layers below it and blends its result
+   back over that composite through its mask and opacity, the way photo
+   editors stack adjustment layers:
 
      composite_0 = base
      composite_i = composite_{i-1} + (filter_i(composite_{i-1}) - composite_{i-1})
@@ -21,6 +24,7 @@
    only change its contribution, so they invalidate the layers above but not
    the layer itself."
   (:require [clojure.string :as str]
+            [almaz.color :as c]
             [relatum.core :as rc]
             [relatum.schema :as s]))
 
@@ -43,27 +47,86 @@
    [:base        :int     :nullable]        ; native handles
    [:preview     :int     :nullable]
    [:thumb       :int     :nullable]
-   [:thumb-rev   :int     :default 0]])
+   [:thumb-rev   :int     :default 0]
+   [:thumb-sig   :text    :nullable]        ; output-signature the thumbnail shows
+   ;; geometry (almaz.geom): orientation and the kept rect, source px
+   [:orient      :int     :default 0 :check [:and [>= :orient 0] [<= :orient 7]]]
+   [:crop-x      :int     :nullable]
+   [:crop-y      :int     :nullable]
+   [:crop-w      :int     :nullable]
+   [:crop-h      :int     :nullable]
+   ;; the crop's constraint (almaz.crop) and the custom aspect ratio
+   [:constrain   :keyword :default :free]
+   [:ratio-w     :real    :default 3.0 :check [> :ratio-w 0.0]]
+   [:ratio-h     :real    :default 2.0 :check [> :ratio-h 0.0]]])
 
-(s/create-table :layer
-  [[:id          :int     :primary :key :auto]
-   [:doc-id      :int     :references :doc :on-delete :cascade]
-   [:position    :int]                      ; stack order, bottom first
-   [:kind        :keyword :check [contains? #{:denoise :sharpen} :kind]]
-   [:enabled     :bool    :default true]
-   [:opacity     :real    :default 1.0 :check [:and [>= :opacity 0.0] [<= :opacity 1.0]]]
-   [:model       :keyword :check [contains? #{:ai :classic} :model]]
-   [:detail      :real    :default 0.0]
-   [:amount      :real    :default 1.0]
-   [:radius      :real    :default 1.5]
-   [:feather     :real    :default 24.0]
-   [:mask-rev    :int     :default 0]
-   [:done-sig    :text    :nullable]        ; the signature its output matches
-   [:partial-rev :int     :nullable]        ; mask-rev of a run that skipped tiles
-   [:img         :int     :nullable]        ; native handles
-   [:mask        :int     :nullable]]
-  ;; one layer per position in a document's stack
-  :unique [[:doc-id :position]])
+(def tone-keys [:exposure :contrast :highlights :shadows :whites :blacks :saturation])
+
+(defn- colour-params [kind] (assoc (c/defaults kind) :model :classic))
+
+(def kinds
+  "Layer kinds, in pipeline order (denoise before sharpen: sharpening noise
+   amplifies it; repairs over the restored image; the colour adjustments
+   after them,
+   in darktable's order: tone, levels, colour balance, hue and saturation,
+   selective colour, black & white, then the vignette over the result).
+   :tab is where its panel lives, :params its settings' defaults. A :live
+   kind is computed as it is drawn (no processing, no pixels of its own)."
+  {:denoise   {:label "Denoise" :order 0 :tab :enhance :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
+   :sharpen   {:label "Sharpen" :order 1 :tab :enhance :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
+   ;; the Repair brush: its mask is what to repair (empty to start), filled
+   ;; from the surroundings (almaz.engine/repair!)
+   :repair    {:label "Repair" :order 2 :tab :enhance :mask-input true :mask-fill 0.0 :feather 3.0
+               :params {:model :classic}}
+   :light     {:label "Light" :order 3 :tab :color :live true
+               :params (assoc (zipmap tone-keys (repeat 0.0)) :model :classic)}
+   :levels    {:label "Levels" :order 4 :tab :color :live true :params (colour-params :levels)}
+   :balance   {:label "Color Balance" :order 5 :tab :color :live true :params (colour-params :balance)}
+   :hsl       {:label "Hue & Saturation" :order 6 :tab :color :live true :params (colour-params :hsl)}
+   :selective {:label "Selective Color" :order 7 :tab :color :live true :params (colour-params :selective)}
+   :bw        {:label "Black & White" :order 8 :tab :color :live true :params (colour-params :bw)}
+   :vignette  {:label "Vignette" :order 9 :tab :color :live true :params (colour-params :vignette)}})
+
+(defn kinds-in
+  "The kinds whose panels live in `tab`, in pipeline order."
+  [tab]
+  (->> kinds (filter #(= tab (:tab (val %)))) (sort-by (comp :order val)) (mapv key)))
+
+(def ^:private colour-columns
+  "One real column per colour setting, its range checked."
+  (for [[_ m] (sort-by key c/settings)
+        [k [d lo hi]] (sort-by key m)]
+    [k :real :default d :check [:and [>= k lo] [<= k hi]]]))
+
+(s/create-table* :layer
+  (into
+   [[:id          :int     :primary :key :auto]
+    [:doc-id      :int     :references :doc :on-delete :cascade]
+    [:position    :int]                      ; stack order (the kind's), bottom first
+    [:kind        :keyword :check [contains? (set (keys kinds)) :kind]]
+    [:enabled     :bool    :default true]
+    [:opacity     :real    :default 1.0 :check [:and [>= :opacity 0.0] [<= :opacity 1.0]]]
+    [:model       :keyword :check [contains? #{:ai :classic} :model]]
+    [:detail      :real    :default 0.0]
+    [:amount      :real    :default 1.0]
+    [:radius      :real    :default 1.5]
+    ;; light adjustments (exposure in EV; the rest -1..1, 0 neutral)
+    [:exposure    :real    :default 0.0 :check [:and [>= :exposure -5.0] [<= :exposure 5.0]]]
+    [:contrast    :real    :default 0.0 :check [:and [>= :contrast -1.0] [<= :contrast 1.0]]]
+    [:highlights  :real    :default 0.0 :check [:and [>= :highlights -1.0] [<= :highlights 1.0]]]
+    [:shadows     :real    :default 0.0 :check [:and [>= :shadows -1.0] [<= :shadows 1.0]]]
+    [:whites      :real    :default 0.0 :check [:and [>= :whites -1.0] [<= :whites 1.0]]]
+    [:blacks      :real    :default 0.0 :check [:and [>= :blacks -1.0] [<= :blacks 1.0]]]
+    [:saturation  :real    :default 0.0 :check [:and [>= :saturation -1.0] [<= :saturation 1.0]]]
+    [:feather     :real    :default 24.0]
+    [:mask-rev    :int     :default 0]
+    [:done-sig    :text    :nullable]        ; the signature its output matches
+    [:partial-rev :int     :nullable]        ; mask-rev of a run that skipped tiles
+    [:img         :int     :nullable]        ; native handles
+    [:mask        :int     :nullable]]
+   colour-columns)
+  ;; one layer per position, and one of each kind, in a document's stack
+  :unique [[:doc-id :position] [:doc-id :kind]])
 
 ;; the source photo's shooting metadata, carried into exports
 (s/create-table :exif
@@ -82,15 +145,31 @@
 ;; a document's layers in stack order (rc/children)
 (s/create-index :layer [:doc-id :position] :type :btree)
 
-(def kinds
-  "Filter kinds, in pipeline order (denoise before sharpen: sharpening noise
-   amplifies it). :params are the defaults."
-  {:denoise {:label "Denoise" :order 0 :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
-   :sharpen {:label "Sharpen" :order 1 :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}})
+(defn params
+  "A layer's settings (its kind's parameters)."
+  [layer]
+  (select-keys layer (keys (get-in kinds [(:kind layer) :params]))))
 
-(def param-keys [:model :detail :amount :radius])
+(defn live? "Is the layer computed as it's drawn?" [layer] (boolean (get-in kinds [(:kind layer) :live])))
 
-(defn params [layer] (select-keys layer param-keys))
+(defn mask-input?
+  "Is the layer's mask what it works on (its output depends on the mask),
+   rather than only where its result shows?"
+  [layer] (boolean (get-in kinds [(:kind layer) :mask-input])))
+
+(defn mask-fill "A new mask's value for the layer: 1 everywhere, 0 for repairs." [layer]
+  (get-in kinds [(:kind layer) :mask-fill] 1.0))
+
+(defn tone
+  "A light layer's adjustments, or nil for other kinds."
+  [layer]
+  (when (= :light (:kind layer)) (select-keys layer tone-keys)))
+
+(defn colour
+  "A colour adjustment layer's [kind settings] (almaz.color), or nil."
+  [layer]
+  (when (contains? c/settings (:kind layer))
+    [(:kind layer) (select-keys layer (keys (c/settings (:kind layer))))]))
 
 (defn empty-db [] (rc/create-db))
 
@@ -129,53 +208,32 @@
   (when-let [l (layer db id)]
     (first (keep-indexed (fn [i x] (when (= id (:id x)) i)) (layers db (:doc-id l))))))
 
-(defn add-layer
-  "Add a `kind` layer just above the topmost layer that comes before it in
-   the pipeline (denoise before sharpen), or at the bottom. Returns
-   [db layer-id]."
+(defn layer-of
+  "Doc `doc-id`'s layer of `kind`, or nil."
   [db doc-id kind]
-  (let [id (rc/next-id db :layer)
-        o (get-in kinds [kind :order])
-        pos (inc (reduce max -1 (keep-indexed (fn [i l] (when (<= (get-in kinds [(:kind l) :order]) o) i))
-                                              (layers db doc-id))))
-        db (rc/update db :layer [:and [= :doc-id doc-id] [>= :position pos]] update :position inc)]
-    [(rc/insert db :layer (merge (get-in kinds [kind :params])
-                                 {:doc-id doc-id :kind kind :position pos}))
-     id]))
+  (first (filter #(= kind (:kind %)) (layers db doc-id))))
+
+(defn ensure-layer
+  "Doc `doc-id`'s layer of `kind`, created (enabled, at its kind's defaults
+   and place in the pipeline) when it has none. Returns [db layer-id]."
+  [db doc-id kind]
+  (if-let [l (layer-of db doc-id kind)]
+    [db (:id l)]
+    (let [id (rc/next-id db :layer)]
+      [(rc/insert db :layer (merge (get-in kinds [kind :params])
+                                   {:doc-id doc-id :kind kind :position (get-in kinds [kind :order])}
+                                   (when-let [f (get-in kinds [kind :feather])] {:feather f})))
+       id])))
 
 (defn update-layer [db id f & args]
   (apply rc/update db :layer [= :id id] f args))
 
 (defn set-param [db id k v] (update-layer db id assoc k v))
 
-(defn remove-layer [db id]
-  (rc/delete db :layer [= :id id]))
-
-(defn- move-target
-  "The layer `id` would swap with moving `dir` places, or nil: moves stay
-   among layers of the same kind, so the pipeline order (denoise below
-   sharpen) holds. Sharpening a noisy image amplifies the noise into
-   artifacts that no later denoise removes."
-  [db id dir]
-  (when-let [l (layer db id)]
-    (let [ls (layers db (:doc-id l))
-          j (+ (layer-index db id) dir)]
-      (when (< -1 j (count ls))
-        (let [other (nth ls j)]
-          (when (= (:kind other) (:kind l)) other))))))
-
-(defn can-move? [db id dir] (some? (move-target db id dir)))
-
-(defn move-layer
-  "Move a layer one place up (+1) or down (-1) the stack, swapping with the
-   neighbour it passes; a no-op when that would cross the pipeline order or
-   leave the stack."
-  [db id dir]
-  (if-let [other (move-target db id dir)]
-    (let [swap {id (:position other) (:id other) (:position (layer db id))}]
-      (rc/update db :layer [contains? (set (keys swap)) :id]
-                 #(assoc % :position (swap (:id %)))))
-    db))
+(defn reset-params
+  "Put a layer's settings back to its kind's defaults."
+  [db id]
+  (update-layer db id #(merge % (dissoc (get-in kinds [(:kind %) :params]) :model))))
 
 (defn denoised-below?
   "Is there an enabled denoise layer under layer `id`?"
@@ -219,27 +277,51 @@
                     focal (conj (str (Math/round (double focal)) " mm"))))))
 
 ;; ---- staleness ---------------------------------------------------------------
-(defn signatures
-  "Each layer's signature (as stored in :done-sig): its kind and params and
-   the signature of the composite it reads."
+(defn- stack-signatures
+  "[each layer's signature, the signature of the composite on top, each
+   layer's input signature (its signature but for its own mask)]."
   [db doc-id]
-  (loop [ls (layers db doc-id) below [doc-id] acc []]
+  (loop [ls (layers db doc-id) below [doc-id] acc [] inputs []]
     (if-let [l (first ls)]
-      (let [sig [(:kind l) (params l) below]]
+      (let [input [(:kind l) (params l) below]
+            sig (cond-> input
+                  (mask-input? l) (conj [:mask (:id l) (:mask-rev l)]))]
         (recur (rest ls)
                ;; the layer's id stands for its mask: two layers' masks can
                ;; differ at equal revisions, so equal settings aren't equal input
                (if (:enabled l)
                  (conj below [(:id l) sig (:opacity l) (:mask-rev l) (:feather l)])
                  below)
-               (conj acc (pr-str sig))))
-      acc)))
+               (conj acc (pr-str sig))
+               (conj inputs (pr-str input))))
+      [acc below inputs])))
+
+(defn input-signatures
+  "Each layer's signature but for its own mask: what it reads and how. A
+   repair whose input signature is unchanged since it last finished only
+   needs redoing where its mask changed."
+  [db doc-id]
+  (nth (stack-signatures db doc-id) 2))
+
+(defn signatures
+  "Each layer's signature (as stored in :done-sig): its kind and params and
+   the signature of the composite it reads."
+  [db doc-id]
+  (first (stack-signatures db doc-id)))
+
+(defn output-signature
+  "The signature of what the doc's whole stack draws, cropped and turned."
+  [db doc-id]
+  (pr-str [(second (stack-signatures db doc-id))
+           (select-keys (doc db doc-id) [:orient :crop-x :crop-y :crop-w :crop-h])]))
 
 (defn- stale-layer?
   "Its signature changed, or it was processed only where its mask was set
-   (:partial-rev, the mask revision then) and the mask changed since."
+   (:partial-rev, the mask revision then) and the mask changed since. Live
+   layers never are."
   [l sig]
   (and (:enabled l)
+       (not (live? l))
        (or (not= sig (:done-sig l))
            (and (:partial-rev l) (not= (:partial-rev l) (:mask-rev l))))))
 

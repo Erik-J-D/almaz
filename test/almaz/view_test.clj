@@ -67,3 +67,23 @@
       (is (v/on-split? vw 503))
       (is (not (v/on-split? vw 540)))
       (is (not (v/on-split? (assoc vw :mode :single) 500))))))
+
+(deftest smooth-zoom
+  (testing "a wheel step moves the target scale, clamped to the zoom range"
+    (is (close? (* 2.0 (Math/pow v/wheel-factor 3)) (v/wheel-target 2.0 3)))
+    (is (close? (/ 2.0 v/wheel-factor) (v/wheel-target 2.0 -1)))
+    (is (= v/max-scale (v/wheel-target v/max-scale 5)))
+    (is (= v/min-scale (v/wheel-target v/min-scale -5))))
+  (testing "each frame covers a fixed fraction of the remaining zoom (in log scale), about the anchor"
+    (let [vw (assoc base :scale 1.0)
+          before (v/->image vw 300 200)
+          z (v/zoom-toward vw 4.0 [300 200] 0.5)]
+      (is (close? 2.0 (:scale z)))
+      (is (= :manual (:zoom z)))
+      (let [after (v/->image z 300 200)]
+        (is (close? (first before) (first after)))
+        (is (close? (second before) (second after))))))
+  (testing "close enough snaps to the target, which ends the animation"
+    (is (= 4.0 (:scale (v/zoom-toward (assoc base :scale 3.99) 4.0 [0 0] 0.5))))
+    (is (v/settled? (assoc base :scale 4.0) 4.0))
+    (is (not (v/settled? (assoc base :scale 3.0) 4.0)))))
