@@ -2,6 +2,7 @@
   "The ONNX Runtime backend against the trivial fixtures in test/almaz/fixtures/.
    Needs native/onnxruntime/build.sh."
   (:require [clojure.test :refer [deftest is testing]]
+            [almaz.infer.ep :as ep]
             [almaz.infer.onnxruntime :as ort]
             [almaz.infer.protocol :as p]
             [jolt.ffi :as ffi]))
@@ -29,7 +30,7 @@
 
 (deftest native-path
   (testing "run-native reads and writes caller-owned buffers, no copies through Clojure"
-    (doseq [ep [:cpu :coreml]]
+    (doseq [ep (if (= :macos (ep/detect-platform)) [:cpu :coreml] [:cpu])]
       (with-session ep "test/almaz/fixtures/add1.onnx"
         (fn [b s]
           (let [in (ffi/alloc (* 4 48)) out (ffi/alloc (* 4 48))]

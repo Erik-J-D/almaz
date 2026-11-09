@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Linux, CPU only: builds every native library from pinned sources and runs the
+# full test suite plus the namespace load-check. The CUDA/TensorRT execution
+# providers need a GPU runner and aren't exercised here; the AI model tests
+# skip without the models (they are fetched on first use, ~0.7 GB).
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      JOLT_VERSION: v0.8.25
+      ORT_VERSION: 1.31.1
+      LIBRAW_SHA: 0b87f5c907d7ee0e7641dd1b6a6c9140b9451922
+      BUI_SHA: 79be8e30bbbc28c8224274d342081e8f522d34cf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config zlib1g-dev \
+            libjpeg-dev libpng-dev libtiff-dev libx11-dev
+
+      - name: Install jolt
+        run: |
+          curl -fsSL "https://github.com/jolt-lang/jolt/releases/download/${JOLT_VERSION}/jolt-${JOLT_VERSION}-x86_64-linux.tar.gz" | tar xz -C "$HOME"
+          echo "$HOME/jolt-${JOLT_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Cache jolt deps and native sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.jolt/gitlibs
+            ~/deps
+          key: linux-${{ env.JOLT_VERSION }}-${{ env.ORT_VERSION }}-${{ env.LIBRAW_SHA }}-${{ env.BUI_SHA }}-${{ hashFiles('deps.edn') }}
+
+      - name: ONNX Runtime
+        run: |
+          mkdir -p ~/deps
+          if [ ! -d ~/deps/onnxruntime ]; then
+            curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" | tar xz -C ~/deps
+            mv ~/deps/onnxruntime-linux-x64-${ORT_VERSION} ~/deps/onnxruntime
+          fi
+
+      - name: LibRaw
+        run: |
+          if [ ! -f ~/deps/libraw/lib/libraw_r.a ]; then
+            git clone https://github.com/LibRaw/LibRaw ~/deps/libraw
+            git -C ~/deps/libraw checkout "$LIBRAW_SHA"
+            make -C ~/deps/libraw -f Makefile.dist -j"$(nproc)" library CFLAGS="-O3 -I. -w -fPIC -DUSE_ZLIB"
+          fi
+
+      - name: BUI kit
+        run: |
+          if [ ! -f ~/deps/bui/lib/libbui.so ]; then
+            git clone https://github.com/ppmpreetham/BUI ~/deps/bui
+            git -C ~/deps/bui checkout "$BUI_SHA"
+            cmake -S ~/deps/bui -B ~/deps/bui/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            cmake --build ~/deps/bui/build --parallel
+            mkdir -p ~/deps/bui/lib
+            c++ -shared -o ~/deps/bui/lib/libbui.so -Wl,--whole-archive \
+              ~/deps/bui/build/kit/libbui_kit.a ~/deps/bui/build/gpu/libbui_gpu.a ~/deps/bui/build/core/libbui_core.a \
+              -Wl,--no-whole-archive -lm -lpthread -ldl
+          fi
+
+      - name: Native libraries
+        run: |
+          native/img/build.sh
+          LIBRAW_DIR=~/deps/libraw native/raw/build.sh
+          ONNXRUNTIME_INC=~/deps/onnxruntime/include ONNXRUNTIME_LIB=~/deps/onnxruntime/lib native/onnxruntime/build.sh
+
+      - name: RAW samples
+        run: native/tools/fetch_samples.sh
+
+      - name: Tests
+        env:
+          LD_LIBRARY_PATH: /home/runner/deps/bui/lib:/home/runner/deps/onnxruntime/lib
+        run: jolt -M:test
+
+      - name: Load-check
+        env:
+          LD_LIBRARY_PATH: /home/runner/deps/bui/lib:/home/runner/deps/onnxruntime/lib
+        run: jolt -M:check

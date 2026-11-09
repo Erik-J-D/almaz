@@ -34,14 +34,14 @@
                {:name "almazinfer-onnxruntime"
                 :optional true
                 :darwin ["native/onnxruntime/lib/libalmazinfer_onnxruntime.dylib"]
-                :linux  ["libalmazinfer_onnxruntime.so"]}
+                :linux  ["native/onnxruntime/lib/libalmazinfer_onnxruntime.so" "libalmazinfer_onnxruntime.so"]}
                {:name "almazinfer-coreml"
                 :optional true
                 :darwin ["native/coreml/lib/libalmazinfer_coreml.dylib"]}
                {:name "almazinfer-raw"
                 :optional true
                 :darwin ["native/raw/lib/libalmazinfer_raw.dylib"]
-                :linux  ["libalmazinfer_raw.so"]}]
+                :linux  ["native/raw/lib/libalmazinfer_raw.so" "libalmazinfer_raw.so"]}]
 
  ;; dev/debug entry points under test/ — only the app itself ships from src/.
  :aliases {:run   {:main-opts ["-m" "almaz.core"]}

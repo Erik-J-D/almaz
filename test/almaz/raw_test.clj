@@ -13,19 +13,25 @@
   (is (not (raw/raw-file? "x.jpg")))
   (is (not (raw/raw-file? "noext"))))
 
+(defn- have-nef? []
+  (or (.exists (java.io.File. nef))
+      (do (println "skipping: DSC_9852.NEF (Nikon Z 9 HE) isn't public") false)))
+
 (deftest full-decode
+  (when (have-nef?)
   (testing "full resolution, demosaiced, plausible colours"
     (let [img (raw/decode nef)]
       (is (= [8280 5520] [(px/width img) (px/height img)]))
       (let [[r g b] (px/pixel img 4140 2760)]
         (is (every? #(< 0.0 % 1.0) [r g b]) "no channel clipped at the centre"))
-      (px/free-image! img))))
+      (px/free-image! img)))))
 
 (deftest embedded-thumbnail
+  (when (have-nef?)
   (let [t (raw/thumbnail nef)]
     (is (some? t))
     (is (pos? (px/width t)))
-    (px/free-image! t)))
+    (px/free-image! t))))
 
 (deftest decode-error
   (is (thrown? Exception (raw/decode "nope.NEF"))))
@@ -35,6 +41,7 @@
    :taken "2026:10:10 11:30:31" :iso 5000 :focal35 480 :orientation 1})
 
 (deftest camera-metadata
+  (when (have-nef?)
   (testing "the NEF's own EXIF (it is TIFF-structured)"
     (let [m (px/read-meta nef)]
       (is (= nef-meta (select-keys m (keys nef-meta))))
@@ -46,7 +53,7 @@
       (is (= 5000 (:iso m)))
       (is (= 8.0 (:fnumber m)))
       (is (< (Math/abs (- 0.0005 (:exposure m))) 1e-9))
-      (is (= "2026:10:10 11:30:31" (:taken m))))))
+      (is (= "2026:10:10 11:30:31" (:taken m)))))))
 
 ;; Sony A7 III, uncompressed 14-bit (raw.pixls.us, CC0): native/tools/fetch_samples.sh
 (def arw "ILCE-7M3.ARW")
