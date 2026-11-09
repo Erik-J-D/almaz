@@ -9,14 +9,17 @@
 
    Modes: single (after), split (before | after at a draggable divider) and
    side by side (before and after panes in sync). Pointer: drag pans, wheel
-   zooms about the pointer, double click toggles fit / 100%; with a mask tool
-   active, drag paints or erases the layer's mask."
+   zooms about the pointer (eased: see almaz.view's smooth zoom), double click
+   toggles fit / 100%; with a mask tool active, drag paints or erases the
+   layer's mask, and holding Space drags to pan instead."
   (:require [almaz.doc :as d]
             [almaz.engine :as eng]
             [almaz.pixels :as px]
             [almaz.state :as s]
             [almaz.view :as v]
-            [jolt.ffi :as ffi]))
+            [glimmer.core :as ui]
+            [jolt.ffi :as ffi])
+  (:import (java.util.concurrent LinkedBlockingQueue TimeUnit)))
 
 (def bg [36 36 36 255])
 (def mask-tint [1.0 0.25 0.2 0.45])
@@ -124,7 +127,7 @@
 
 (defn- overlay-items [doc view tool cursor]
   (cond-> (if doc (compare-items view) [])
-    (and cursor (:base doc) (#{:paint :erase} (:mode tool))) (conj (brush-item view tool cursor))
+    (and cursor (:base doc) (#{:paint :erase} (:mode tool)) (not @s/space*)) (conj (brush-item view tool cursor))
     (status-text view doc) (conj (status-text view doc))))
 
 ;; ---- input ---------------------------------------------------------------------
@@ -141,10 +144,56 @@
                                 :flow (:flow tool) :erase? (= :erase (:mode tool))})
   (s/bump-pixels!))
 
+;; ---- smooth zoom ---------------------------------------------------------------
+;; Wheel steps set {:target scale :x :y (the anchor, pane coords)}; a daemon
+;; thread eases the view towards it on the UI thread, one frame per tick,
+;; until it settles.
+(defonce ^:private zoom-goal (atom nil))
+(defonce ^:private zoom-wake (LinkedBlockingQueue.))
+(def ^:private ease-ms
+  "Time constant of the easing: each `ease-ms` covers ~63% of what's left,
+   however long frames take to draw."
+  45.0)
+(def ^:private frame-ms 8)
+
+(defn- zoom-frame!
+  "Advance the zoom by `dt-ms` of easing; true while there is more to do."
+  [dt-ms]
+  (let [p (promise)
+        k (- 1.0 (Math/exp (- (/ (min dt-ms 100.0) ease-ms))))]
+    (ui/on-gui (fn []
+                 (deliver p (if-let [{:keys [target x y] :as goal} @zoom-goal]
+                              (let [vw (swap! s/view* v/zoom-toward target x y k)]
+                                (if (v/settled? vw target)
+                                  (do (compare-and-set! zoom-goal goal nil) false)
+                                  true))
+                              false))))
+    (deref p 500 false)))
+
+(defn- stop-zoom! [] (reset! zoom-goal nil))
+
+(defonce ^:private zoomer
+  (delay (doto (Thread. (fn []
+                          (loop []
+                            (.take zoom-wake)
+                            (try
+                              (loop [t (- (System/nanoTime) (* frame-ms 1000000))]
+                                (let [now (System/nanoTime)]
+                                  (when (zoom-frame! (/ (- now t) 1e6))
+                                    (Thread/sleep frame-ms)
+                                    (recur now))))
+                              (catch Throwable e
+                                (stop-zoom!)
+                                (binding [*out* *err*] (println "almaz: zoom failed:" (ex-message e)))))
+                            (recur))))
+           (.setDaemon true)
+           (.start))))
+
 (defn on-press [x y]
+  (stop-zoom!)
   (let [view @s/view* tool @s/tool* doc (s/current-doc)
         [px* py*] (pane-xy view x y)
-        mask (when (:base doc) (tool-mask (s/layers (:id doc)) tool))]
+        mask (when (and (:base doc) (not @s/space*)) (tool-mask (s/layers (:id doc)) tool))]
     (cond
       (v/on-split? view x) (reset! drag {:kind :split})
       mask (let [p (v/->image view px* py*)]
@@ -172,13 +221,27 @@
         (s/edit! id d/bump-mask (:layer tool)))))
   (reset! drag nil))
 
-(defn on-wheel [delta]
-  (let [view @s/view*
-        [x y] (or @s/cursor* [(/ (:cw view) 2.0) (/ (:ch view) 2.0)])
-        [px* py*] (pane-xy view x y)]
-    (swap! s/view* v/zoom-at (Math/pow 1.15 (double delta)) px* py*)))
+(def ^:private shift 1)
+
+(defn on-wheel
+  "Zoom about the pointer. Shift + wheel is how the kit reports a sideways
+   scroll (a diagonal trackpad swipe sends both), which doesn't zoom."
+  [delta mods]
+  (when (zero? (bit-and (long mods) shift))
+    (let [view @s/view*
+          [x y] (or @s/cursor* [(/ (:cw view) 2.0) (/ (:ch view) 2.0)])
+          [px* py*] (pane-xy view x y)]
+      (swap! zoom-goal (fn [g] {:target (v/wheel-target (or (:target g) (:scale view)) (double delta))
+                                :x px* :y py*}))
+      @zoomer
+      (.offer zoom-wake :zoom))))
+
+(defn- space? [k] (= "space" k))
+(defn on-key [k _] (when (space? k) (reset! s/space* true)))
+(defn on-keyrelease [k _] (when (space? k) (reset! s/space* false)))
 
 (defn on-double [_ _]
+  (stop-zoom!)
   (when-let [{:keys [w h]} (s/current-doc)]
     (when w
       (if (= :fit (:zoom @s/view*))
@@ -205,6 +268,7 @@
     [:canvas {:stretch true :events 1
               :on-configure on-configure :on-press on-press :on-motion on-motion
               :on-release on-release :on-wheel on-wheel :on-double on-double
+              :on-key on-key :on-keyrelease on-keyrelease
               :on-leave #(reset! s/cursor* nil)
               :canvas-items (into [{:id 1 :type :image :coords [0 0 w h] :rgba ptr
                                     :iw w :ih h :fit 0 :version version}]

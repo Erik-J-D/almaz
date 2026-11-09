@@ -44,6 +44,34 @@
            :ox (- sx (* ix s))
            :oy (- sy (* iy s)))))
 
+;; ---- smooth zoom -----------------------------------------------------------------
+;; The window kit reports scrolling as whole wheel steps (a trackpad's precise
+;; deltas arrive as one step per 12 points), so applying each step directly
+;; zooms in visible jumps. Steps move a target scale instead, and the view
+;; eases towards it a frame at a time.
+
+(def wheel-factor "Zoom per wheel step." 1.1)
+
+(defn wheel-target
+  "The target scale after `steps` wheel steps from `scale`."
+  [scale steps]
+  (min max-scale (max min-scale (* scale (Math/pow wheel-factor steps)))))
+
+(defn settled?
+  "Is the view's scale within half a percent of `target`?"
+  [{:keys [scale]} target]
+  (< (Math/abs (Math/log (/ target scale))) 0.005))
+
+(defn zoom-toward
+  "One animation frame: cover fraction `k` of the way from the view's scale
+   to `target` (geometrically), keeping pane point (sx, sy) fixed; snap to
+   the target once close."
+  [view target sx sy k]
+  (let [r (/ target (:scale view))
+        f (Math/pow r k)
+        f (if (settled? (update view :scale * f) target) r f)]
+    (zoom-at view f sx sy)))
+
 (defn set-scale
   "Set an absolute scale about the pane centre."
   [view s]
