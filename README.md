@@ -243,6 +243,6 @@ the UI in smoke tests).
 
 ## License
 
-GPL-2.0-or-later (glimmer-bui's BUI kit and the shims are GPL). The NAFNet
+GPL-3.0 (glimmer-bui's BUI kit and the shims are GPL). The NAFNet
 weights are MIT licensed (Copyright (c) 2022 megvii-model), with parts from
 BasicSR under Apache-2.0; the release ships their license text.
