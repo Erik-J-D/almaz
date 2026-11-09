@@ -61,7 +61,9 @@
    [:done-sig    :text    :nullable]        ; the signature its output matches
    [:partial-rev :int     :nullable]        ; mask-rev of a run that skipped tiles
    [:img         :int     :nullable]        ; native handles
-   [:mask        :int     :nullable]])
+   [:mask        :int     :nullable]]
+  ;; one layer per position in a document's stack
+  :unique [[:doc-id :position]])
 
 ;; the source photo's shooting metadata, carried into exports
 (s/create-table :exif

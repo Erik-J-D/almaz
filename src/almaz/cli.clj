@@ -84,24 +84,39 @@ Results are named <input>-almaz.<ext> and keep the input's EXIF.")
         parsed (map #(parse-setting f %) tokens)]
     [(into {} (remove map? parsed)) (keep :error (filter map? parsed)) more]))
 
+(defn- flag [k] (fn [o _] [(assoc o k true) 0]))
+
+(defn- with-value
+  "An option that takes the next argument: (f opts value) -> opts'."
+  [what f]
+  (fn [o v] [(if v (f o v) (update o :errors conj (str what " needs a value"))) 1]))
+
+(def ^:private options
+  "Option -> (fn [opts next-arg] [opts' extra-args-consumed])."
+  {"--override" (flag :override)
+   "--showSettings" (flag :show)
+   "--show-settings" (flag :show)
+   "-h" (flag :help)
+   "--help" (flag :help)
+   "-o" (with-value "--output" #(assoc %1 :out %2))
+   "--output" (with-value "--output" #(assoc %1 :out %2))
+   "--format" (with-value "--format"
+                (fn [o v] (if-let [fmt (formats v)]
+                            (assoc o :format fmt)
+                            (update o :errors conj (str "unknown format " v " (jpeg, tiff, png, png8)")))))
+   "--quality" (with-value "--quality"
+                 (fn [o v] (let [q (some-> v parse-number long)]
+                             (if (and q (<= 1 q 100))
+                               (assoc o :quality q)
+                               (update o :errors conj "--quality must be 1..100")))))
+   "--upscale" (fn [o _] [(update o :errors conj "--upscale is not supported") 0])})
+
 (defn- parse-option
   "One non-filter option at the head of args: [opts' rest]."
-  [o [a v & more :as args]]
-  (case a
-    "--override" [(assoc o :override true) (rest args)]
-    ("--showSettings" "--show-settings") [(assoc o :show true) (rest args)]
-    ("-h" "--help") [(assoc o :help true) (rest args)]
-    ("-o" "--output") [(if v (assoc o :out v) (update o :errors conj "--output needs a directory")) more]
-    "--format" [(if-let [fmt (formats v)]
-                  (assoc o :format fmt)
-                  (update o :errors conj (str "unknown format " v " (jpeg, tiff, png, png8)")))
-                more]
-    "--quality" [(let [q (some-> v parse-number long)]
-                   (if (and q (<= 1 q 100))
-                     (assoc o :quality q)
-                     (update o :errors conj "--quality must be 1..100")))
-                 more]
-    "--upscale" [(update o :errors conj "--upscale is not supported") (rest args)]
+  [o [a v & _ :as args]]
+  (if-let [handle (options a)]
+    (let [[o' used] (handle o v)]
+      [o' (drop (inc used) args)])
     [(update o :errors conj (str "unknown option " a)) (rest args)]))
 
 (defn parse

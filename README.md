@@ -42,8 +42,9 @@ denoise ~45 s, sharpen ~45 s for the whole frame, export ~6 s.
 
 Documents and their filter layers live in a [relatum](https://github.com/yogthos/relatum)
 database (`almaz.doc`): `:doc` and `:layer` tables with typed columns, checks
-(status and kind sets, opacity in [0, 1]), and a cascading foreign key from
-layers to their document. Functions take the db and return the new one; the
+(status and kind sets, opacity in [0, 1]), a cascading foreign key from
+layers to their document, and one layer per position in a document's stack
+(`:unique [[:doc-id :position]]`). Functions take the db and return the new one; the
 app keeps it in one reactive cell (`almaz.state/db*`). UI-only state (view,
 tool, selection, job progress) stays in plain cells.
 

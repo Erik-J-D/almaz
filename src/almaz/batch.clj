@@ -38,6 +38,23 @@
                    :op (eng/op-for f (model-session f))})
     out))
 
+(defn- run-filters!
+  "Run `filters` in order over `base`; returns the layer stack (each output
+   is also recorded in the `outputs` atom, so it is freed whatever happens)."
+  [base filters outputs]
+  (reduce (fn [below f]
+            (let [img (run-filter! base below f)]
+              (swap! outputs conj img)
+              (conj below {:img img :opacity (:opacity f) :enabled true})))
+          [] filters))
+
+(defn- export! [opts path base layers]
+  (let [dest (cli/output-path opts path)]
+    (when-let [dir (.getParentFile (java.io.File. dest))] (.mkdirs dir))
+    (px/save-image! base layers {:path dest :format (:format opts) :quality (:quality opts)
+                                 :meta (raw/source-meta path)})
+    dest))
+
 (defn- process-file!
   "Process one input; returns the output path."
   [opts path]
@@ -45,18 +62,9 @@
         outputs (atom [])]
     (try
       (let [est (px/estimate base)
-            filters (cli/plan opts est)
-            dest (cli/output-path opts path)]
+            filters (cli/plan opts est)]
         (when (:show opts) (println (cli/describe path est filters)))
-        (let [layers (reduce (fn [below f]
-                               (let [img (run-filter! base below f)]
-                                 (swap! outputs conj img)
-                                 (conj below {:img img :opacity (:opacity f) :enabled true})))
-                             [] filters)]
-          (when-let [dir (.getParentFile (java.io.File. dest))] (.mkdirs dir))
-          (px/save-image! base layers {:path dest :format (:format opts) :quality (:quality opts)
-                                       :meta (raw/source-meta path)})
-          dest))
+        (export! opts path base (run-filters! base filters outputs)))
       (finally
         (run! px/free-image! @outputs)
         (px/free-image! base)))))
