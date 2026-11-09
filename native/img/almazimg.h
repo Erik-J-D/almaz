@@ -133,6 +133,11 @@ int almz_meta_read(const char *path, AlmzMeta *out);
  * Returns the length; *out is malloc'd. 0 when there is nothing to write. */
 size_t almz_exif_build(const AlmzMeta *m, uint8_t **out);
 
+/* -- integrity ---------------------------------------------------------- */
+/* SHA-256 of a file as 64 lowercase hex chars (+ NUL) into `hex`. 1 on
+ * success, 0 when the file can't be read. */
+int almz_sha256_file(const char *path, char *hex);
+
 /* -- file I/O ------------------------------------------------------------ */
 enum { ALMZ_FMT_PNG16 = 1, ALMZ_FMT_PNG8, ALMZ_FMT_JPEG, ALMZ_FMT_TIFF16 };
 /* Load a JPEG / PNG / TIFF (by content). NULL on error (*err malloc'd). */

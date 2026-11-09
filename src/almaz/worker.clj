@@ -143,8 +143,16 @@
         (when-not (= img (:img (s/layer lid))) (life/retire! [:img img]))
         img)))
 
-(defn- session-for [layer label]
+(defn- mb [n] (quot n 1000000))
+
+(defn- session-for
+  "The layer's model session, downloading the model first if it is missing."
+  [layer label]
   (when-let [m (eng/model-id layer)]
+    (models/ensure-model! m (fn [got total]
+                              (reset! s/job* {:label (str "Downloading " label " model ("
+                                                          (mb got) "/" (mb (or total 0)) " MB)")
+                                              :done got :total total})))
     (reset! s/job* {:label (str "Loading " label " model")})
     (models/session m)))
 

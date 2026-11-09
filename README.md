@@ -106,8 +106,16 @@ cd ~/src/libraw && make -f Makefile.dist -j8 library   # lib/libraw_r.a
 
 ## Models
 
-Both are official NAFNet checkpoints (megvii-research, Apache-2.0), exported to
-fixed 512x512 ONNX graphs by `native/tools/export_nafnet.py`, which defines the
+Both are official NAFNet checkpoints (megvii-research; MIT, with parts from
+BasicSR under Apache-2.0), exported to fixed 512x512 ONNX graphs. The app
+downloads them on first use from the
+[`models-v1` release](https://github.com/yogthos/almaz/releases/tag/models-v1)
+and verifies each against its pinned SHA-256 (`almaz.models/registry`) before
+using it. They go to `~/Library/Application Support/almaz/models` on macOS,
+`$XDG_DATA_HOME/almaz/models` (or `~/.local/share/almaz/models`) on Linux,
+`models/almaz` in a source checkout, or `$ALMAZ_MODELS` when set.
+
+To re-export them yourself, `native/tools/export_nafnet.py` defines the
 architecture inline and loads checkpoints with torch's safe `weights_only`
 unpickler:
 
@@ -159,5 +167,6 @@ the UI in smoke tests).
 
 ## License
 
-GPL-2.0-or-later (glimmer-bui's BUI kit and the shims are GPL). NAFNet weights
-are Apache-2.0.
+GPL-2.0-or-later (glimmer-bui's BUI kit and the shims are GPL). The NAFNet
+weights are MIT licensed (Copyright (c) 2022 megvii-model), with parts from
+BasicSR under Apache-2.0; the release ships their license text.

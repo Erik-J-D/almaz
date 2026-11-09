@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export an official NAFNet checkpoint (megvii-research/NAFNet, Apache-2.0) to
+"""Export an official NAFNet checkpoint (megvii-research/NAFNet; MIT, parts from BasicSR under Apache-2.0) to
 ONNX for the almaz inference layer.
 
 The architecture is defined inline (a faithful transcription of
