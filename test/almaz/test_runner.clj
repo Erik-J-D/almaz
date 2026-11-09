@@ -8,7 +8,7 @@
             almaz.ep-test])
 
 (def native '[almaz.download-test almaz.pixels-test almaz.raw-test almaz.ort-test almaz.coreml-test
-              almaz.engine-test almaz.cli-test])
+              almaz.engine-test almaz.cli-test almaz.worker-test])
 
 (defmethod t/report :error [m]
   (t/with-test-out

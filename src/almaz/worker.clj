@@ -253,9 +253,13 @@
 (defonce ^:private thread (atom nil))
 
 (defn start!
-  "Start the worker thread (once). It takes no work until the UI loop runs:
-   before that, a change to a reactive cell re-renders synchronously on the
-   changing thread, and a render racing the window's mount duplicates nodes."
+  "Start the worker thread (once) and return it. It takes no work until the UI
+   loop runs: before that, a change to a reactive cell re-renders
+   synchronously on the changing thread, and a render racing the window's
+   mount duplicates nodes. It is a daemon: the app ends when its window
+   closes, mid-job or not."
   []
-  (when-not @thread
-    (reset! thread (doto (Thread. (fn [] (loop [] (step!) (recur)))) (.start)))))
+  (or @thread
+      (reset! thread (doto (Thread. (fn [] (loop [] (step!) (recur))))
+                       (.setDaemon true)
+                       (.start)))))
