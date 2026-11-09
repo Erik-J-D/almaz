@@ -47,3 +47,30 @@
       (is (= 8.0 (:fnumber m)))
       (is (< (Math/abs (- 0.0005 (:exposure m))) 1e-9))
       (is (= "2026:10:10 11:30:31" (:taken m))))))
+
+;; Sony A7 III, uncompressed 14-bit (raw.pixls.us, CC0): native/tools/fetch_samples.sh
+(def arw "ILCE-7M3.ARW")
+(defn- have? [f] (.exists (java.io.File. f)))
+
+(deftest sony-arw
+  (if-not (have? arw)
+    (println "skipping sony-arw: run native/tools/fetch_samples.sh")
+    (do
+      (testing "decodes at full resolution with plausible colours"
+        (let [img (raw/decode arw)
+              [r g b] (px/pixel img (quot (px/width img) 2) (quot (px/height img) 2))]
+          (is (= [6024 4024] [(px/width img) (px/height img)]))
+          (is (every? #(< 0.0 % 1.0) [r g b]))
+          (px/free-image! img)))
+      (testing "its EXIF reads (ARW is TIFF-structured), and LibRaw agrees"
+        (let [m (px/read-meta arw)]
+          (is (= {:make "SONY" :model "ILCE-7M3" :lens "FE 16-35mm F2.8 GM"
+                  :taken "2018:03:14 10:42:42" :iso 400 :focal35 35}
+                 (select-keys m [:make :model :lens :taken :iso :focal35])))
+          (is (< (Math/abs (- 0.008 (:exposure m))) 1e-9))
+          (is (= 5.0 (:fnumber m)))
+          (is (= 400 (:iso (raw/metadata arw))))))
+      (testing "the embedded preview"
+        (let [t (raw/thumbnail arw)]
+          (is (pos? (px/width t)))
+          (px/free-image! t))))))
