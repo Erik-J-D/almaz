@@ -47,8 +47,7 @@
 (defn- refs [doc-id] (eng/layer-refs (s/layers doc-id)))
 
 ;; ---- loading -------------------------------------------------------------------
-(defn- decode [{:keys [path raw]}]
-  (if raw (raw/decode path) (px/load-image path)))
+(defn- decode [{:keys [path]}] (raw/load-any path))
 
 (defn- autopilot! [id]
   (let [dc (s/doc id)]
@@ -81,20 +80,12 @@
   (px/free-image! base)
   (drop-preview! id assoc :status :thumb))
 
-(defn- source-meta
-  "The source file's shooting metadata: its own EXIF when it is readable
-   (JPEG, PNG, TIFF-structured RAW), else LibRaw's decoded fields. A RAW
-   decode is already rotated upright, so its orientation becomes 1."
-  [{:keys [path raw]}]
-  (let [m (or (px/read-meta path) (when raw (raw/metadata path)))]
-    (cond-> m (and m raw) (assoc :orientation 1))))
-
 (defn- install!
   "The decoded image becomes the doc's base; analyze it and run autopilot."
   [{:keys [id name]} base]
   (let [w (px/width base) h (px/height base)]
     (drop-preview! id assoc :base base :w w :h h :status :ready)
-    (when-let [m (source-meta (s/doc id))] (s/swap-db! d/set-exif id m))
+    (when-let [m (raw/source-meta (:path (s/doc id)))] (s/swap-db! d/set-exif id m))
     (life/ensure-masks! id)
     (when (= :fit (:zoom @s/view*)) (swap! s/view* v/fit w h))
     (s/bump-pixels!)

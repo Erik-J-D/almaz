@@ -150,6 +150,19 @@ jolt check     # load every namespace
 jolt run       # the app (opens DSC_9852.NEF when present, or files given as args)
 ```
 
+Batch processing (no window) whenever an option is given:
+
+```sh
+jolt run --showSettings DSC_9852.NEF                     # autopilot picks the filters
+jolt run --noise strength=60 -o out *.NEF                # adjust what autopilot chose
+jolt run --override --sharpen model=classic radius=2 x.jpg   # exactly these filters
+jolt run --help                                          # every option
+```
+
+Results are written as `<name>-almaz.<ext>` with the input's EXIF; the exit
+status is 0 when every file went through, 1 when some failed, 2 for a usage
+error.
+
 Interactive development: `jolt nrepl-server`, then from the REPL
 
 ```clojure
