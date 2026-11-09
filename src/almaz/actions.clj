@@ -3,7 +3,9 @@
    They run on the UI thread; slow work is left to the worker (almaz.worker)."
   (:require [clojure.string :as str]
             [glimmer-bui.ffi :as bk]
+            [almaz.autopilot :as ap]
             [almaz.doc :as d]
+            [almaz.engine :as eng]
             [almaz.lifecycle :as life]
             [almaz.pixels :as px]
             [almaz.raw :as raw]
@@ -78,6 +80,21 @@
 
 (defn move-layer! [lid dir] (when-let [id (cur-id)] (s/edit! id d/move-layer lid dir)))
 (defn set-param! [lid k val] (when-let [id (cur-id)] (s/edit! id d/set-param lid k val)))
+(defn reset-tone!
+  "Put a light layer's adjustments back to neutral."
+  [lid]
+  (when-let [id (cur-id)]
+    (s/edit! id d/update-layer lid merge (dissoc (get-in d/kinds [:light :params]) :model))))
+(defn auto-exposure!
+  "Set a light layer's exposure so the image under it reaches white (its
+   brightest 1%), the brightening raw converters otherwise apply unasked."
+  [lid]
+  (when-let [{:keys [id base]} (s/current-doc)]
+    (when base
+      (let [below (take-while #(not= lid (:id %)) (s/layers id))
+            {:keys [l]} (px/histogram base (eng/layer-refs below))]
+        (set-param! lid :exposure (ap/auto-exposure l))))))
+
 (defn set-layer! [lid k val] (when-let [id (cur-id)] (s/edit! id d/update-layer lid assoc k val)))
 
 (defn- with-mask! [lid f]

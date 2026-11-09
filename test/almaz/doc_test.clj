@@ -133,3 +133,38 @@
               db (d/move-layer db a 1)]
           (is (= 3 (count (set (map :position (d/layers db 1))))))
           (is (= [b] (mapv :id (d/layers (-> db (d/remove-layer a) (d/remove-layer c)) 1)))))))))
+
+(deftest light-layers
+  (let [[db s] (d/add-layer db0 1 :sharpen)
+        [db l] (d/add-layer db 1 :light)
+        [db n] (d/add-layer db 1 :denoise)]
+    (testing "light adjustments go on top of the filters, at neutral settings"
+      (is (= [:denoise :sharpen :light] (kinds db)))
+      (is (= {:exposure 0.0 :contrast 0.0 :highlights 0.0 :shadows 0.0 :whites 0.0 :blacks 0.0 :saturation 0.0}
+             (d/tone (d/layer db l))))
+      (is (not (d/can-move? db l -1)) "the filters stay below it"))
+    (testing "an adjustment is computed as it's drawn: never queued for processing"
+      (let [db (processed db)]
+        (is (d/processed? db 1))
+        (let [y (d/set-param db l :exposure 1.5)]
+          (is (d/processed? y 1))
+          (is (= 1.5 (:exposure (d/tone (d/layer y l))))))
+        (is (= [0 1] (d/stale-indices (d/set-param (d/update-layer db l assoc :done-sig nil) n :detail 0.5) 1))
+            "editing a filter below doesn't queue it either")))
+    (testing "the settings stay in range"
+      (is (thrown? Exception (d/set-param db l :exposure 9.0)))
+      (is (thrown? Exception (d/set-param db l :contrast -1.5))))
+    (is (= :light (:kind (d/layer db l))))
+    (is s)))
+
+(deftest output-signature
+  (let [[db l] (d/add-layer db0 1 :light)
+        sig (d/output-signature db 1)]
+    (testing "names what the whole stack draws: any change to it is a new picture"
+      (is (= sig (d/output-signature db 1)))
+      (is (not= sig (d/output-signature (d/set-param db l :exposure 1.0) 1)))
+      (is (not= sig (d/output-signature (d/update-layer db l assoc :opacity 0.5) 1)))
+      (is (not= sig (d/output-signature (d/bump-mask db l) 1))))
+    (testing "a disabled layer draws nothing"
+      (is (= (d/output-signature db0 1)
+             (d/output-signature (d/update-layer db l assoc :enabled false) 1))))))

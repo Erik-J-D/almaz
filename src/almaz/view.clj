@@ -64,9 +64,9 @@
 
 (defn zoom-toward
   "One animation frame: cover fraction `k` of the way from the view's scale
-   to `target` (geometrically), keeping pane point (sx, sy) fixed; snap to
-   the target once close."
-  [view target sx sy k]
+   to `target` (geometrically), keeping pane point `anchor` [sx sy] fixed;
+   snap to the target once close."
+  [view target [sx sy] k]
   (let [r (/ target (:scale view))
         f (Math/pow r k)
         f (if (settled? (update view :scale * f) target) r f)]

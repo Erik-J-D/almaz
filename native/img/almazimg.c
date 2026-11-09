@@ -327,6 +327,61 @@ static inline void sample(const AlmzImg *img, int k, float lx, float ly, int nea
     c[ch] = (a[ch] * (1 - fx) + b[ch] * fx) * (1 - fy) + (e[ch] * (1 - fx) + f[ch] * fx) * fy;
 }
 
+/* ---- light adjustments -------------------------------------------------- */
+static inline float srgb_to_lin(float v) {
+  return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
+}
+static inline float lin_to_srgb(float v) {
+  return v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
+
+/* The tone curve on an sRGB value. Each step maps 0..1 onto itself and is
+ * increasing, so the whole curve is: exposure (linear light, clipped), the
+ * white and black points, shadows and highlights (bumps that vanish at both
+ * ends, peaking at 1/3 and 2/3, scaled to stay increasing), then contrast
+ * (a power S-curve about the middle). */
+static float tone_curve(float x, const AlmzTone *t) {
+  if (t->exposure != 0.0f) x = lin_to_srgb(MIN(srgb_to_lin(x) * exp2f(t->exposure), 1.0f));
+  const float wp = 1.0f - 0.25f * t->whites, bp = -0.1f * t->blacks;
+  x = CLAMP((x - bp) / (wp - bp), 0.0f, 1.0f);
+  x += 0.9f * t->shadows * x * (1.0f - x) * (1.0f - x);
+  x += 0.9f * t->highlights * x * x * (1.0f - x);
+  if (t->contrast != 0.0f) {
+    const float g = exp2f(t->contrast);
+    x = x < 0.5f ? 0.5f * powf(2.0f * x, g) : 1.0f - 0.5f * powf(2.0f * (1.0f - x), g);
+  }
+  return CLAMP(x, 0.0f, 1.0f);
+}
+
+void almz_tone_lut(const AlmzTone *t, float *lut) {
+  for (int i = 0; i < ALMZ_TONE_N; i++) lut[i] = tone_curve((float)i / (ALMZ_TONE_N - 1), t);
+}
+
+/* lut applied to a 0..65535 value */
+static inline float lut_at(const float *lut, float v) {
+  const float f = CLAMP(v / 65535.0f, 0.0f, 1.0f) * (ALMZ_TONE_N - 1);
+  const int i = MIN((int)f, ALMZ_TONE_N - 2);
+  const float fr = f - i;
+  return (lut[i] + (lut[i + 1] - lut[i]) * fr) * 65535.0f;
+}
+
+/* curve each channel of c (0..65535), then scale the colour about its luma */
+static inline void tone_px(const float *lut, float sat, const float *c, float *o) {
+  for (int ch = 0; ch < 3; ch++) o[ch] = lut_at(lut, c[ch]);
+  if (sat != 0.0f) {
+    const float l = 0.2126f * o[0] + 0.7152f * o[1] + 0.0722f * o[2];
+    for (int ch = 0; ch < 3; ch++) o[ch] = CLAMP(l + (o[ch] - l) * (1.0f + sat), 0.0f, 65535.0f);
+  }
+}
+
+void almz_tone_apply(const AlmzTone *t, float *rgb) {
+  float lut[ALMZ_TONE_N], c[3], o[3];
+  almz_tone_lut(t, lut);
+  for (int ch = 0; ch < 3; ch++) c[ch] = rgb[ch] * 65535.0f;
+  tone_px(lut, t->saturation, c, o);
+  for (int ch = 0; ch < 3; ch++) rgb[ch] = o[ch] / 65535.0f;
+}
+
 /* Composite at level-0 image coordinates (ix, iy) using pyramid level k. */
 static inline void composite_at(const AlmzImg *base, const AlmzLayer *layers, int n, int k,
                                 float ix, float iy, int nearest, float *c) {
@@ -335,12 +390,15 @@ static inline void composite_at(const AlmzImg *base, const AlmzLayer *layers, in
   sample(base, k, lx, ly, nearest, c);
   for (int i = 0; i < n; i++) {
     const AlmzLayer *L = &layers[i];
-    if (!L->enabled || !L->img || L->opacity <= 0) continue;
+    if (!L->enabled || !(L->img || L->lut) || L->opacity <= 0) continue;
     float a = L->opacity;
     if (L->mask) a *= mask_at(L->mask, ix / L->mask->div - 0.5f, iy / L->mask->div - 0.5f);
     if (a <= 0) continue;
     float l[3];
-    sample(L->img, MIN(k, L->img->nlev - 1), lx, ly, nearest, l);
+    if (L->lut)
+      tone_px(L->lut, L->saturation, c, l);
+    else
+      sample(L->img, MIN(k, L->img->nlev - 1), lx, ly, nearest, l);
     c[0] += (l[0] - c[0]) * a;
     c[1] += (l[1] - c[1]) * a;
     c[2] += (l[2] - c[2]) * a;
@@ -403,6 +461,75 @@ void almz_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
   if (tint) memcpy(c.tint, tint, sizeof(c.tint));
   if (bg) memcpy(c.bg, bg, 4);
   par_range(ry, ry + rh, 8, render_rows, &c);
+}
+
+/* ---- histogram ---------------------------------------------------------- */
+typedef struct {
+  const AlmzImg *base;
+  const AlmzLayer *layers;
+  int n, k;
+  uint32_t *out;
+} hist_ctx;
+
+static inline int bin8(float v) { return CLAMP((int)(v / 257.0f + 0.5f), 0, 255); }
+
+static void hist_rows(void *p, int y0, int y1) {
+  const hist_ctx *c = (const hist_ctx *)p;
+  uint32_t h[4 * 256] = {0};
+  const int w = c->base->lw[c->k];
+  const float s = (float)(1 << c->k);
+  for (int y = y0; y < y1; y++)
+    for (int x = 0; x < w; x++) {
+      float v[3];
+      composite_at(c->base, c->layers, c->n, c->k, (x + 0.5f) * s, (y + 0.5f) * s, 1, v);
+      h[bin8(v[0])]++;
+      h[256 + bin8(v[1])]++;
+      h[512 + bin8(v[2])]++;
+      h[768 + bin8(0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2])]++;
+    }
+  for (int i = 0; i < 4 * 256; i++)
+    if (h[i]) __atomic_fetch_add(&c->out[i], h[i], __ATOMIC_RELAXED);
+}
+
+void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int n, uint32_t *out) {
+  memset(out, 0, 4 * 256 * sizeof(uint32_t));
+  int k = 0;
+  while (k + 1 < base->nlev && (size_t)base->lw[k] * base->lh[k] > 1500000) k++;
+  hist_ctx c = {base, layers, n, k, out};
+  par_for(base->lh[k], 16, hist_rows, &c);
+}
+
+void almz_histogram_draw(const uint32_t *hist, int w, int h, uint8_t *out, const uint8_t *bg) {
+  /* scale to the tallest bin, leaving out the end bins (clipped shadows and
+   * highlights pile up there and would flatten everything else) */
+  uint32_t top = 1;
+  for (int ch = 0; ch < 3; ch++)
+    for (int i = 1; i < 255; i++) top = MAX(top, hist[ch * 256 + i]);
+  static const float rgb[3][3] = {{0.95f, 0.30f, 0.30f}, {0.30f, 0.85f, 0.35f}, {0.35f, 0.50f, 1.0f}};
+  for (int x = 0; x < w; x++) {
+    const float f = (x + 0.5f) * 256.0f / w;
+    const int i = MIN((int)f, 255);
+    float bar[3];
+    for (int ch = 0; ch < 3; ch++) bar[ch] = MIN(1.0f, (float)hist[ch * 256 + i] / top) * h;
+    for (int y = 0; y < h; y++) {
+      const float up = (float)(h - y) - 0.5f; /* height above the bottom */
+      float col[3] = {0, 0, 0};
+      int any = 0;
+      for (int ch = 0; ch < 3; ch++)
+        if (bar[ch] > up) {
+          any = 1;
+          for (int q = 0; q < 3; q++) col[q] += rgb[ch][q];
+        }
+      uint8_t *o = out + ((size_t)y * w + x) * 4;
+      if (any) {
+        for (int q = 0; q < 3; q++)
+          o[q] = (uint8_t)CLAMP((int)(bg[q] * 0.3f + MIN(col[q], 1.0f) * 0.7f * 255.0f), 0, 255);
+        o[3] = 255;
+      } else {
+        memcpy(o, bg, 4);
+      }
+    }
+  }
 }
 
 /* ---- tiles ------------------------------------------------------------- */

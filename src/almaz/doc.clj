@@ -43,19 +43,28 @@
    [:base        :int     :nullable]        ; native handles
    [:preview     :int     :nullable]
    [:thumb       :int     :nullable]
-   [:thumb-rev   :int     :default 0]])
+   [:thumb-rev   :int     :default 0]
+   [:thumb-sig   :text    :nullable]])      ; output-signature the thumbnail shows
 
 (s/create-table :layer
   [[:id          :int     :primary :key :auto]
    [:doc-id      :int     :references :doc :on-delete :cascade]
    [:position    :int]                      ; stack order, bottom first
-   [:kind        :keyword :check [contains? #{:denoise :sharpen} :kind]]
+   [:kind        :keyword :check [contains? #{:denoise :sharpen :light} :kind]]
    [:enabled     :bool    :default true]
    [:opacity     :real    :default 1.0 :check [:and [>= :opacity 0.0] [<= :opacity 1.0]]]
    [:model       :keyword :check [contains? #{:ai :classic} :model]]
    [:detail      :real    :default 0.0]
    [:amount      :real    :default 1.0]
    [:radius      :real    :default 1.5]
+   ;; light adjustments (exposure in EV; the rest -1..1, 0 neutral)
+   [:exposure    :real    :default 0.0 :check [:and [>= :exposure -5.0] [<= :exposure 5.0]]]
+   [:contrast    :real    :default 0.0 :check [:and [>= :contrast -1.0] [<= :contrast 1.0]]]
+   [:highlights  :real    :default 0.0 :check [:and [>= :highlights -1.0] [<= :highlights 1.0]]]
+   [:shadows     :real    :default 0.0 :check [:and [>= :shadows -1.0] [<= :shadows 1.0]]]
+   [:whites      :real    :default 0.0 :check [:and [>= :whites -1.0] [<= :whites 1.0]]]
+   [:blacks      :real    :default 0.0 :check [:and [>= :blacks -1.0] [<= :blacks 1.0]]]
+   [:saturation  :real    :default 0.0 :check [:and [>= :saturation -1.0] [<= :saturation 1.0]]]
    [:feather     :real    :default 24.0]
    [:mask-rev    :int     :default 0]
    [:done-sig    :text    :nullable]        ; the signature its output matches
@@ -82,15 +91,29 @@
 ;; a document's layers in stack order (rc/children)
 (s/create-index :layer [:doc-id :position] :type :btree)
 
+(def tone-keys [:exposure :contrast :highlights :shadows :whites :blacks :saturation])
+
 (def kinds
-  "Filter kinds, in pipeline order (denoise before sharpen: sharpening noise
-   amplifies it). :params are the defaults."
+  "Layer kinds, in pipeline order (denoise before sharpen: sharpening noise
+   amplifies it; light adjustments last, over the restored image). :params
+   are the defaults. A :live kind is computed as it is drawn (no processing,
+   no pixels of its own)."
   {:denoise {:label "Denoise" :order 0 :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
-   :sharpen {:label "Sharpen" :order 1 :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}})
+   :sharpen {:label "Sharpen" :order 1 :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
+   :light   {:label "Light" :order 2 :live true
+             :params (assoc (zipmap tone-keys (repeat 0.0)) :model :classic)}})
 
-(def param-keys [:model :detail :amount :radius])
+(defn params
+  "A layer's settings (its kind's parameters)."
+  [layer]
+  (select-keys layer (keys (get-in kinds [(:kind layer) :params]))))
 
-(defn params [layer] (select-keys layer param-keys))
+(defn live? "Is the layer computed as it's drawn?" [layer] (boolean (get-in kinds [(:kind layer) :live])))
+
+(defn tone
+  "A light layer's adjustments, or nil for other kinds."
+  [layer]
+  (when (= :light (:kind layer)) (select-keys layer tone-keys)))
 
 (defn empty-db [] (rc/create-db))
 
@@ -219,9 +242,8 @@
                     focal (conj (str (Math/round (double focal)) " mm"))))))
 
 ;; ---- staleness ---------------------------------------------------------------
-(defn signatures
-  "Each layer's signature (as stored in :done-sig): its kind and params and
-   the signature of the composite it reads."
+(defn- stack-signatures
+  "[each layer's signature, the signature of the composite on top]."
   [db doc-id]
   (loop [ls (layers db doc-id) below [doc-id] acc []]
     (if-let [l (first ls)]
@@ -233,13 +255,26 @@
                  (conj below [(:id l) sig (:opacity l) (:mask-rev l) (:feather l)])
                  below)
                (conj acc (pr-str sig))))
-      acc)))
+      [acc below])))
+
+(defn signatures
+  "Each layer's signature (as stored in :done-sig): its kind and params and
+   the signature of the composite it reads."
+  [db doc-id]
+  (first (stack-signatures db doc-id)))
+
+(defn output-signature
+  "The signature of what the doc's whole stack draws."
+  [db doc-id]
+  (pr-str (second (stack-signatures db doc-id))))
 
 (defn- stale-layer?
   "Its signature changed, or it was processed only where its mask was set
-   (:partial-rev, the mask revision then) and the mask changed since."
+   (:partial-rev, the mask revision then) and the mask changed since. Live
+   layers never are."
   [l sig]
   (and (:enabled l)
+       (not (live? l))
        (or (not= sig (:done-sig l))
            (and (:partial-rev l) (not= (:partial-rev l) (:mask-rev l))))))
 

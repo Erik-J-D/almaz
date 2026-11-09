@@ -6,16 +6,19 @@
    the result shows up where the user is looking and grows outwards. All pixel
    work is native: tile extraction (which composites the layers below on the
    fly), inference straight from native buffers, and the crossfaded write."
-  (:require [almaz.infer.protocol :as p]
+  (:require [almaz.doc :as d]
+            [almaz.infer.protocol :as p]
             [almaz.infer.tile :as tile]
             [almaz.pixels :as px]
             [jolt.ffi :as ffi]))
 
 (defn layer-refs
-  "A doc's layers as the pixel engine's stack entries."
+  "A doc's layers as the pixel engine's stack entries (light layers carry
+   their adjustments as :tone)."
   [layers]
-  (mapv (fn [{:keys [img mask opacity enabled]}]
-          {:img img :mask mask :opacity opacity :enabled enabled})
+  (mapv (fn [{:keys [img mask opacity enabled] :as l}]
+          (cond-> {:img img :mask mask :opacity opacity :enabled enabled}
+            (d/tone l) (assoc :tone (d/tone l))))
         layers))
 
 (defn- model-op [{:keys [backend session spec]} detail]

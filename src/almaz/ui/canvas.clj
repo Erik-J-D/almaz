@@ -163,7 +163,7 @@
         k (- 1.0 (Math/exp (- (/ (min dt-ms 100.0) ease-ms))))]
     (ui/on-gui (fn []
                  (deliver p (if-let [{:keys [target x y] :as goal} @zoom-goal]
-                              (let [vw (swap! s/view* v/zoom-toward target x y k)]
+                              (let [vw (swap! s/view* v/zoom-toward target [x y] k)]
                                 (if (v/settled? vw target)
                                   (do (compare-and-set! zoom-goal goal nil) false)
                                   true))

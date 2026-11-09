@@ -65,6 +65,9 @@ int almz_raw_decode16(const char* path, int half_size, int* width, int* height,
   d->params.user_qual = 3;          // AHD
   d->params.gamm[0] = 1.0 / 2.4;    // sRGB transfer curve
   d->params.gamm[1] = 12.92;
+  // No automatic brightening: LibRaw otherwise rescales every image so 1% of
+  // its pixels clip. Brightness is the user's call (a Light layer).
+  d->params.no_auto_bright = 1;
 
   ret = libraw_dcraw_process(d);
   if (ret != LIBRAW_SUCCESS) return fail(d, err, libraw_strerror(ret));

@@ -50,6 +50,10 @@
   [:pointer :pointer :int32 :pointer :int32 :int32 :pointer :pointer] :int32 :blocking)
 (ffi/defcfn meta-read*      "almz_meta_read"      [:pointer :pointer] :int32 :blocking)
 (ffi/defcfn free-string*    "almz_free_string"    [:pointer] :void)
+(ffi/defcfn tone-lut*       "almz_tone_lut"       [:pointer :pointer] :void)
+(ffi/defcfn tone-apply*     "almz_tone_apply"     [:pointer :pointer] :void)
+(ffi/defcfn histogram*      "almz_histogram"      [:pointer :pointer :int32 :pointer] :void :blocking)
+(ffi/defcfn histogram-draw* "almz_histogram_draw" [:pointer :int32 :int32 :pointer :pointer] :void)
 
 ;; ---- errors ------------------------------------------------------------------
 (defn- call-with-err
@@ -116,10 +120,45 @@
   (mask-stroke* m (double x0) (double y0) (double x1) (double y1)
                 (double radius) (double hardness) (double flow) (if erase? 1 0)))
 
+;; ---- light adjustments -------------------------------------------------------
+(def ^:private tone-fields [:exposure :contrast :highlights :shadows :whites :blacks :saturation])
+(def ^:private tone-layout
+  (ffi/layout [:struct [[:exposure :float] [:contrast :float] [:highlights :float] [:shadows :float]
+                        [:whites :float] [:blacks :float] [:saturation :float]]]))
+(def ^:private tone-n 4096)
+
+(defn- write-tone [arena tone]
+  (let [p (ffi/alloc arena (ffi/sizeof tone-layout))]
+    (ffi/write p tone-layout (into {} (map (fn [k] [k (float (get tone k 0.0))])) tone-fields) 0)
+    p))
+
+(defn apply-tone
+  "Apply light adjustments `tone` ({:exposure EV, :contrast ... -1..1}) to an
+   sRGB colour [r g b] (0..1)."
+  [tone rgb]
+  (with-open [a (ffi/confined-arena)]
+    (let [c (ffi/alloc a (* 4 3))]
+      (ffi/write-array c :float (float-array (map float rgb)))
+      (tone-apply* (write-tone a tone) c)
+      (mapv double (ffi/read-array c :float 3)))))
+
 ;; ---- layer stacks ------------------------------------------------------------
 (def ^:private layer-layout
-  (ffi/layout [:struct [[:img :pointer] [:mask :pointer] [:opacity :float] [:enabled :int32]]]))
+  (ffi/layout [:struct [[:img :pointer] [:mask :pointer] [:opacity :float] [:enabled :int32]
+                        [:lut :pointer] [:saturation :float]]]))
 (def ^:private layer-size (ffi/sizeof layer-layout))
+
+(defn- layer-struct
+  "One layer's AlmzLayer fields. A layer with :tone (light adjustments) gets
+   its curve tabulated into `arena`."
+  [arena {:keys [img mask opacity enabled tone]}]
+  (let [lut (when tone
+              (doto (ffi/alloc arena (* 4 tone-n)) (->> (tone-lut* (write-tone arena tone)))))]
+    {:img (or img ffi/null) :mask (or mask ffi/null)
+     :opacity (float (or opacity 1.0))
+     :enabled (if (and enabled (or img lut)) 1 0)
+     :lut (or lut ffi/null)
+     :saturation (float (get tone :saturation 0.0))}))
 
 (defn- write-layers
   "An AlmzLayer array for `layers` in `arena` (NULL when empty)."
@@ -127,13 +166,30 @@
   (if (empty? layers)
     ffi/null
     (let [arr (ffi/alloc arena (* layer-size (count layers)))]
-      (doseq [[i {:keys [img mask opacity enabled]}] (map-indexed vector layers)]
-        (ffi/write arr layer-layout
-                   {:img (or img ffi/null) :mask (or mask ffi/null)
-                    :opacity (float (or opacity 1.0))
-                    :enabled (if (and enabled img) 1 0)}
-                   (* i layer-size)))
+      (doseq [[i l] (map-indexed vector layers)]
+        (ffi/write arr layer-layout (layer-struct arena l) (* i layer-size)))
       arr)))
+
+;; ---- histogram ---------------------------------------------------------------
+(defn histogram
+  "256-bin histograms of the composite: {:r :g :b :l (Rec. 709 luma)}."
+  [base layers]
+  (with-open [a (ffi/confined-arena)]
+    (let [out (ffi/alloc a (* 4 4 256))]
+      (histogram* base (write-layers a layers) (int (count layers)) out)
+      (let [v (vec (ffi/read-array out :uint32 (* 4 256)))]
+        {:r (subvec v 0 256) :g (subvec v 256 512) :b (subvec v 512 768) :l (subvec v 768 1024)}))))
+
+(defn draw-histogram!
+  "Compute the composite's histogram and draw it into the RGBA8 w x h buffer
+   `out` over `bg` [r g b a]."
+  [base layers {:keys [out w h bg]}]
+  (with-open [a (ffi/confined-arena)]
+    (let [hist (ffi/alloc a (* 4 4 256))
+          bgp (ffi/alloc a 4)]
+      (ffi/write-array bgp (byte-array (map unchecked-byte (or bg [0 0 0 255]))))
+      (histogram* base (write-layers a layers) (int (count layers)) hist)
+      (histogram-draw* hist (int w) (int h) out bgp))))
 
 ;; ---- rendering ---------------------------------------------------------------
 (defn render!

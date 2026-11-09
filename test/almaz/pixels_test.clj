@@ -57,6 +57,78 @@
         (px/free-mask! m)))
     (doseq [i [black white]] (px/free-image! i))))
 
+(def neutral {:exposure 0.0 :contrast 0.0 :highlights 0.0 :shadows 0.0 :whites 0.0 :blacks 0.0 :saturation 0.0})
+
+(defn- tone [params rgb] (px/apply-tone (merge neutral params) rgb))
+(defn- grey [params v] (first (tone params [v v v])))
+
+(deftest tone-curve
+  (testing "neutral settings change nothing"
+    (doseq [c [[0.0 0.0 0.0] [0.2 0.5 0.9] [1.0 1.0 1.0]]]
+      (is (every? true? (map (partial close? 1e-3) c (tone {} c))) (pr-str c))))
+  (testing "exposure scales linear light by 2^EV"
+    ;; sRGB 0.5 is 0.214 linear; doubled, 0.428 linear is sRGB 0.686
+    (is (close? 2e-3 0.686 (grey {:exposure 1.0} 0.5)))
+    (is (close? 2e-3 0.5 (grey {:exposure -1.0} 0.686))))
+  (testing "contrast steepens around the middle"
+    (is (< (grey {:contrast 0.5} 0.25) 0.25))
+    (is (> (grey {:contrast 0.5} 0.75) 0.75))
+    (is (close? 1e-3 0.5 (grey {:contrast 0.5} 0.5)))
+    (is (> (grey {:contrast -0.5} 0.25) 0.25)))
+  (testing "shadows work on the dark end, highlights on the bright end"
+    (let [up (- (grey {:shadows 1.0} 0.25) 0.25)]
+      (is (pos? up))
+      (is (< (- (grey {:shadows 1.0} 0.8) 0.8) (/ up 2))))
+    (let [down (- 0.75 (grey {:highlights -1.0} 0.75))]
+      (is (pos? down))
+      (is (< (- 0.2 (grey {:highlights -1.0} 0.2)) (/ down 2)))))
+  (testing "whites move the white point, blacks the black point"
+    (is (> (grey {:whites 0.5} 0.9) 0.9))
+    (is (< (grey {:blacks -0.5} 0.05) 0.05))
+    (is (> (grey {:blacks 0.5} 0.0) 0.0)))
+  (testing "every setting keeps the curve increasing and inside 0..1"
+    (doseq [k (keys (dissoc neutral :saturation)) v [-1.0 1.0]]
+      (let [ys (map #(grey {k v} (/ % 64.0)) (range 65))]
+        (is (apply <= ys) (str k " " v))
+        (is (every? #(<= 0.0 % 1.0) ys) (str k " " v)))))
+  (testing "saturation scales colour away from (or towards) grey"
+    (let [[r g b] (tone {:saturation -1.0} [0.8 0.4 0.2])]
+      (is (close? 1e-3 r g))
+      (is (close? 1e-3 g b)))
+    (let [[r _ b] (tone {:saturation 0.5} [0.6 0.4 0.3])]
+      (is (> (- r b) 0.3)))
+    (is (every? true? (map (partial close? 1e-3) [0.5 0.5 0.5] (tone {:saturation 1.0} [0.5 0.5 0.5]))))))
+
+(deftest light-layers
+  (let [mid (filled 8 8 (constantly [0.5 0.5 0.5]))
+        brighter (merge neutral {:exposure 1.0})
+        v (fn [layers] (first (render-1px mid layers)))]
+    (testing "an adjustment layer needs no pixels of its own"
+      (is (= 175 (v [{:tone brighter :opacity 1.0 :enabled true}]))))
+    (testing "it blends through its opacity and mask like any layer"
+      (is (= 128 (v [{:tone brighter :opacity 1.0 :enabled false}])))
+      (is (< 128 (v [{:tone brighter :opacity 0.5 :enabled true}]) 175))
+      (let [m (px/new-mask 8 8 1 0.0)]
+        (is (= 128 (v [{:tone brighter :mask m :opacity 1.0 :enabled true}])))
+        (px/free-mask! m)))
+    (px/free-image! mid)))
+
+(deftest histograms
+  (let [img (filled 64 32 (fn [x _] (if (< x 16) [0 0 0] [1 0.5 0])))
+        {:keys [r g b l]} (px/histogram img [])]
+    (testing "256 bins per channel, every pixel counted once"
+      (is (every? #(= 256 (count %)) [r g b l]))
+      (is (every? #(= (* 64 32) (reduce + %)) [r g b l])))
+    (testing "each channel's tones land in their bins"
+      (is (= (* 16 32) (nth r 0)))
+      (is (= (* 48 32) (nth r 255)))
+      (is (= (* 48 32) (nth g 128)))
+      (is (= (* 64 32) (nth b 0))))
+    (testing "the adjustment layers on top are included"
+      (let [h (px/histogram img [{:tone (merge neutral {:saturation -1.0}) :opacity 1.0 :enabled true}])]
+        (is (= (* 48 32) (reduce + (subvec (:b h) 1))))))
+    (px/free-image! img)))
+
 (deftest pyramid
   (testing "zoomed out, the render averages (no aliasing)"
     (let [checker (filled 64 64 (fn [x y] (if (even? (+ x y)) [1 1 1] [0 0 0])))

@@ -4,7 +4,7 @@
   (:require [almaz.actions :as act]
             [almaz.doc :as d]
             [almaz.state :as s]
-            [almaz.worker :as worker]
+            [almaz.loading :as load]
             [almaz.ui.units :refer [px]]
             [almaz.view :as v]))
 
@@ -67,7 +67,7 @@
 
 (defn- thumb [id selected?]
   (let [{ptr :thumb rev :thumb-rev :keys [name status]} (s/doc id)
-        [w h] worker/thumb-size
+        [w h] load/thumb-size
         [tw th] [(px 88) (px 59)]]
     [:vbox {:key id :weight 0 :spacing 2}
      [:canvas {:reqwidth tw :reqheight th :events 1

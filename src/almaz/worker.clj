@@ -5,111 +5,22 @@
 
    Priorities: a pending export of the current image, then loading the
    current image, then (re)processing its first stale layer once edits have
-   settled, then filmstrip thumbnails for images not opened yet. A layer job
-   is cancelled as soon as the layer's signature changes (an edit underneath
-   it, or the layer itself), it is disabled, or another image is selected."
+   settled, then redrawing its thumbnail when the picture changed without
+   processing (light adjustments), then filmstrip thumbnails for images not
+   opened yet. A layer job is cancelled as soon as the layer's signature
+   changes (an edit underneath it, or the layer itself), it is disabled, or
+   another image is selected. Loading and thumbnails live in almaz.loading."
   (:require [glimmer.backend :as b]
-            [almaz.autopilot :as ap]
             [almaz.doc :as d]
             [almaz.engine :as eng]
             [almaz.lifecycle :as life]
+            [almaz.loading :as load]
             [almaz.models :as models]
             [almaz.pixels :as px]
-            [almaz.raw :as raw]
             [almaz.state :as s]
-            [almaz.view :as v]
-            [jolt.ffi :as ffi]))
+            [almaz.view :as v]))
 
 (def settle-ms "Processing waits this long after the last edit." 400)
-(def thumb-size "Filmstrip thumbnails, raster px (2x a 88x59 slot)." [176 118])
-
-;; ---- thumbnails ----------------------------------------------------------------
-(defn render-fit!
-  "Render base + layers to fit inside the w x h RGBA buffer `out` (the rest bg)."
-  [{:keys [out w h bg]} base layers]
-  (let [iw (px/width base) ih (px/height base)
-        s (min (/ w (double iw)) (/ h (double ih)))]
-    (px/render! base layers {:ox (/ (- w (* s iw)) 2.0) :oy (/ (- h (* s ih)) 2.0) :scale s
-                             :out out :out-w w :out-h h :bg bg})))
-
-(defn- set-thumb!
-  "Render `img` (+ layers) as doc `id`'s filmstrip thumbnail."
-  [id img layers]
-  (let [[w h] thumb-size
-        old (:thumb (s/doc id))
-        p (ffi/alloc (* 4 w h))]
-    (render-fit! {:out p :w w :h h :bg [40 40 40 255]} img layers)
-    (s/swap-doc! id #(-> % (assoc :thumb p) (update :thumb-rev inc)))
-    (if (= p (:thumb (s/doc id)))
-      (when old (life/retire! [:raw old]))
-      (ffi/free p))))
-
-(defn- refs [doc-id] (eng/layer-refs (s/layers doc-id)))
-
-;; ---- loading -------------------------------------------------------------------
-(defn- decode [{:keys [path]}] (raw/load-any path))
-
-(defn- autopilot! [id]
-  (let [dc (s/doc id)]
-    (when (and @s/autopilot* (empty? (s/layers id)) (not (:autopiloted dc)) (d/estimate dc))
-      (s/edit! id life/with-autopilot id)
-      (life/ensure-masks! id))))
-
-(defn- show-preview!
-  "Show the camera's embedded preview while the full image decodes."
-  [{:keys [id path thumb]}]
-  (when-let [t (raw/thumbnail path)]
-    (if (= id @s/current*)
-      (do (s/swap-doc! id assoc :preview t)
-          (when-not thumb (set-thumb! id t []))
-          (s/bump-pixels!))
-      (px/free-image! t))))
-
-(defn- drop-preview!
-  "Retire the preview and apply `f` to the doc."
-  [id f & args]
-  (let [preview (:preview (s/doc id))]
-    (apply s/swap-doc! id f args)
-    (s/swap-doc! id assoc :preview nil)
-    (life/retire! [:img preview])))
-
-(defn- shelve!
-  "The user switched away mid-decode: keep only a thumbnail."
-  [id base]
-  (when-not (:thumb (s/doc id)) (set-thumb! id base []))
-  (px/free-image! base)
-  (drop-preview! id assoc :status :thumb))
-
-(defn- install!
-  "The decoded image becomes the doc's base; analyze it and run autopilot."
-  [{:keys [id name]} base]
-  (let [w (px/width base) h (px/height base)]
-    (drop-preview! id assoc :base base :w w :h h :status :ready)
-    (when-let [m (raw/source-meta (:path (s/doc id)))] (s/swap-db! d/set-exif id m))
-    (life/ensure-masks! id)
-    (when (= :fit (:zoom @s/view*)) (swap! s/view* v/fit w h))
-    (s/bump-pixels!)
-    (when-not (:thumb (s/doc id)) (set-thumb! id base []))
-    (reset! s/job* {:label "Analyzing"})
-    (let [est (px/estimate base)]
-      (s/swap-doc! id merge est)
-      (s/message! (str name ": " w " x " h ", " (ap/describe est))))
-    (autopilot! id)))
-
-(defn- load-doc! [{:keys [id name raw] :as dc}]
-  (s/swap-doc! id assoc :status :loading)
-  (reset! s/job* {:label (str "Opening " name)})
-  (when raw (show-preview! dc))
-  (reset! s/job* {:label (str "Decoding " name)})
-  (let [base (decode dc)]
-    (if (= id @s/current*) (install! dc base) (shelve! id base))))
-
-(defn- thumb-doc! [{:keys [id name raw path] :as dc}]
-  (reset! s/job* {:label (str "Reading " name)})
-  (let [img (or (when raw (raw/thumbnail path)) (decode dc))]
-    (set-thumb! id img [])
-    (px/free-image! img)
-    (s/swap-doc! id assoc :status :thumb)))
 
 ;; ---- processing ----------------------------------------------------------------
 (defn- live-sig
@@ -158,7 +69,7 @@
   [{:keys [id base]} {:keys [lid sig result mask-rev]}]
   (s/swap-layer! lid assoc :done-sig sig :partial-rev (when (= :partial result) mask-rev))
   (when (d/processed? @s/db* id)
-    (set-thumb! id base (refs id))))
+    (load/set-thumb! id base (eng/layer-refs (s/layers id)) (d/output-signature @s/db* id))))
 
 (defn- run-layer!
   "Run the job's tiles; record the result unless it was cancelled."
@@ -218,6 +129,13 @@
     (when (> (- (s/now) (:edited-at cur)) settle-ms)
       [:process cur i])))
 
+(defn- rethumb-task [cur]
+  (let [db @s/db*]
+    (when (and (= :ready (:status cur)) (:base cur) (d/processed? db (:id cur))
+               (> (- (s/now) (:edited-at cur)) settle-ms)
+               (not= (d/output-signature db (:id cur)) (:thumb-sig cur)))
+      [:rethumb cur])))
+
 (defn- thumb-task []
   (when-let [p (first (filter #(= :pending (:status %)) (d/docs @s/db*)))]
     [:thumb p]))
@@ -226,15 +144,16 @@
   "The next job, by priority (see the namespace doc)."
   []
   (let [cur (s/current-doc)]
-    (or (when cur (or (export-task cur) (load-task cur) (process-task cur)))
+    (or (when cur (or (export-task cur) (load-task cur) (process-task cur) (rethumb-task cur)))
         (thumb-task))))
 
 (defn- run-task! [[kind a b]]
   (case kind
     :export  (export! a b)
-    :load    (load-doc! a)
+    :load    (load/load-doc! a)
     :process (process-layer! a b)
-    :thumb   (thumb-doc! a)))
+    :rethumb (load/rethumb! a)
+    :thumb   (load/thumb-doc! a)))
 
 (defn- failed! [[kind doc-or-req] e]
   (s/message! (str "Error: " (ex-message e)))

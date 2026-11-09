@@ -1,14 +1,15 @@
 (ns almaz.ui.sidebar
-  "The right-hand panel: navigator, autopilot, and one panel per filter layer
-   (top of the stack first) with its settings and mask tools."
+  "The right-hand panel: histogram, navigator, autopilot, and one panel per
+   layer (top of the stack first) with its settings and mask tools."
   (:require [almaz.actions :as act]
             [almaz.autopilot :as ap]
             [almaz.doc :as d]
             [almaz.engine :as eng]
+            [almaz.pixels :as px]
             [almaz.state :as s]
             [almaz.ui.units :refer [px]]
             [almaz.view :as v]
-            [almaz.worker :as worker]
+            [almaz.loading :as load]
             [jolt.ffi :as ffi]))
 
 (def width 340)
@@ -23,7 +24,7 @@
     (when (and (:base doc) (not= k (:key @nav)))
       (let [{:keys [ptr] pw :pw ph :ph} @nav
             p (if (and ptr (= [pw ph] [w h])) ptr (do (when ptr (ffi/free ptr)) (ffi/alloc (* 4 w h))))]
-        (worker/render-fit! {:out p :w w :h h :bg [30 30 30 255]} (:base doc) refs)
+        (load/render-fit! {:out p :w w :h h :bg [30 30 30 255]} (:base doc) refs)
         (swap! nav #(-> % (assoc :ptr p :pw w :ph h :key k) (update :version inc)))))
     @nav))
 
@@ -64,12 +65,39 @@
                 [{:id 3 :type :text :coords [(/ w 2.0) (/ h 2.0)] :anchor 0
                   :text "No image" :fill [1 1 1 0.4]}])}]))
 
+;; ---- histogram -----------------------------------------------------------------
+;; Of what the image pane shows (the full stack, light adjustments included),
+;; redrawn only when that changes.
+(defonce ^:private hist (atom {:w 300 :h 100 :ptr nil :key nil :version 0}))
+
+(defn- hist-frame [doc rev]
+  (let [{:keys [w h]} @hist
+        img (or (:base doc) (:preview doc))
+        refs (when (:base doc) (eng/layer-refs (s/layers (:id doc))))
+        k [(:id doc) img refs rev w h]]
+    (when (and img (not= k (:key @hist)))
+      (let [{:keys [ptr] pw :pw ph :ph} @hist
+            p (if (and ptr (= [pw ph] [w h])) ptr (do (when ptr (ffi/free ptr)) (ffi/alloc (* 4 w h))))]
+        (px/draw-histogram! img refs {:out p :w w :h h :bg [30 30 30 255]})
+        (swap! hist #(-> % (assoc :ptr p :pw w :ph h :key k) (update :version inc)))))
+    @hist))
+
+(defn histogram []
+  (let [doc (s/current-doc)
+        {:keys [ptr w h version]} (hist-frame doc @s/pixels-rev*)]
+    [:canvas {:height-units 4 :events 1
+              :on-configure (fn [cw ch] (swap! hist assoc :w (long cw) :h (long ch) :key nil))
+              :canvas-items (if (and ptr (or (:base doc) (:preview doc)))
+                              [{:id 1 :type :image :coords [0 0 w h] :rgba ptr :iw w :ih h :fit 0 :version version}]
+                              [])}]))
+
 ;; ---- layer panels --------------------------------------------------------------
 (defn- pct [x] (Math/round (* 100.0 (double x))))
 
 (defn- layer-status [doc layer sig job]
   (cond
     (not (:enabled layer)) "Disabled"
+    (d/live? layer) nil
     (nil? (:base doc)) "Waiting for the image"
     (= sig (:done-sig layer)) "Up to date"
     job (str "Processing " (or (:done job) 0) "/" (or (:total job) "…"))
@@ -119,26 +147,55 @@
         [:slider {:label "Amount" :min 0 :max 300 :integer 1 :value (pct amount)
                   :on-change #(act/set-param! lid :amount (/ (double %) 100.0))}]])]))
 
+(defn- tone-slider [lid layer k label]
+  [:slider {:label label :min -100 :max 100 :integer 1 :value (pct (get layer k))
+            :on-change #(act/set-param! lid k (/ (double %) 100.0))}])
+
+(defn- light-settings [layer]
+  (let [lid (:id layer)]
+    [:vbox {:spacing 4}
+     [:slider {:label "Exposure" :min -5 :max 5 :precision 2 :value (:exposure layer)
+               :on-change #(act/set-param! lid :exposure (double %))}]
+     (tone-slider lid layer :contrast "Contrast")
+     (tone-slider lid layer :highlights "Highlights")
+     (tone-slider lid layer :shadows "Shadows")
+     (tone-slider lid layer :whites "Whites")
+     (tone-slider lid layer :blacks "Blacks")
+     (tone-slider lid layer :saturation "Saturation")
+     [:hbox {:align 1}
+      [:button {:text "Auto exposure" :on-click #(act/auto-exposure! lid)}]
+      [:button {:text "Reset" :on-click #(act/reset-tone! lid)}]]]))
+
+(defn- layer-buttons [db lid]
+  [:hbox {:align 1}
+   [:button {:text "Move up" :enabled (if (d/can-move? db lid 1) 1 0)
+             :on-click #(act/move-layer! lid 1)}]
+   [:button {:text "Move down" :enabled (if (d/can-move? db lid -1) 1 0)
+             :on-click #(act/move-layer! lid -1)}]
+   [:button {:text "Remove" :on-click #(act/remove-layer! lid)}]])
+
 (defn- layer-panel [{:keys [db doc layer sig job tool]}]
   (let [lid (:id layer)
         label (get-in d/kinds [(:kind layer) :label])]
     [:panel {:key lid :text label}
      [:checkbox {:header true :label "" :value (if (:enabled layer) 1 0)
                  :on-change #(act/set-layer! lid :enabled (pos? %))}]
-     [:label {:text (layer-status doc layer sig job)}]
+     (when-let [st (layer-status doc layer sig job)] [:label {:text st}])
      [:slider {:label "Strength" :min 0 :max 100 :integer 1 :value (pct (:opacity layer))
                :on-change #(act/set-layer! lid :opacity (/ (double %) 100.0))}]
      (case (:kind layer)
        :denoise (denoise-settings layer)
-       :sharpen (sharpen-settings db doc layer))
+       :sharpen (sharpen-settings db doc layer)
+       :light (light-settings layer))
      [:separator]
      (mask-tools layer tool)
-     [:hbox {:align 1}
-      [:button {:text "Move up" :enabled (if (d/can-move? db lid 1) 1 0)
-                :on-click #(act/move-layer! lid 1)}]
-      [:button {:text "Move down" :enabled (if (d/can-move? db lid -1) 1 0)
-                :on-click #(act/move-layer! lid -1)}]
-      [:button {:text "Remove" :on-click #(act/remove-layer! lid)}]]]))
+     (layer-buttons db lid)]))
+
+(defn- add-buttons [doc]
+  [:hbox {:align 1}
+   (for [kind [:denoise :sharpen :light]]
+     [:button {:key kind :text (str "+ " (get-in d/kinds [kind :label]))
+               :on-click #(act/add-layer! kind) :enabled (if doc 1 0)}])])
 
 (defn layers-panel []
   (let [db @s/db*
@@ -149,9 +206,7 @@
         sigs (when doc (d/signatures db (:id doc)))
         stale (when doc (d/next-stale db (:id doc)))]
     [:vbox {:spacing 6}
-     [:hbox {:align 1}
-      [:button {:text "+ Denoise" :on-click #(act/add-layer! :denoise) :enabled (if doc 1 0)}]
-      [:button {:text "+ Sharpen" :on-click #(act/add-layer! :sharpen) :enabled (if doc 1 0)}]]
+     (add-buttons doc)
      (if (seq layers)
        [:vbox {:spacing 4}
         (for [[i layer] (reverse (map-indexed vector layers))]
@@ -169,6 +224,7 @@
 
 (defn sidebar []
   [:vbox {:weight 0 :reqwidth (px width) :padding (px 8) :spacing (px 6)}
+   [histogram]
    [navigator]
    [autopilot-row]
    [:separator]

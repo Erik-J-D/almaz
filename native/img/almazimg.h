@@ -39,13 +39,37 @@ typedef struct AlmzMask {
 
 /* One entry of a layer stack: the filter's output image, its mask (NULL =
  * everywhere) and opacity. Layer i blends over the composite of layers < i:
- *   c = c + (img - c) * opacity * mask */
+ *   c = c + (img - c) * opacity * mask
+ * An adjustment layer has no image: `lut` (ALMZ_TONE_N entries, from
+ * almz_tone_lut) maps each channel of the composite below and `saturation`
+ * then scales its colour, and that result takes img's place. */
 typedef struct AlmzLayer {
   const AlmzImg *img;
   const AlmzMask *mask;
   float opacity;
   int32_t enabled;
+  const float *lut;
+  float saturation;
 } AlmzLayer;
+
+/* Light adjustments. exposure in EV (linear light x 2^EV); the rest -1..1,
+ * 0 = neutral. All work on sRGB-encoded values. */
+typedef struct AlmzTone {
+  float exposure, contrast, highlights, shadows, whites, blacks, saturation;
+} AlmzTone;
+
+#define ALMZ_TONE_N 4096
+/* Tabulate the tone curve of `t` (everything but saturation) over 0..1. */
+void almz_tone_lut(const AlmzTone *t, float *lut);
+/* Apply `t` to one sRGB colour (0..1) in place. */
+void almz_tone_apply(const AlmzTone *t, float *rgb);
+
+/* 256-bin histograms of the composite (r, g, b, then Rec. 709 luma, each 256
+ * counts) from the finest pyramid level of at most ~1.5 MP. */
+void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int nlayers, uint32_t *out);
+/* Draw `hist` (almz_histogram's) as overlapping RGB areas into the RGBA8
+ * w x h buffer `out`, over `bg`. */
+void almz_histogram_draw(const uint32_t *hist, int w, int h, uint8_t *out, const uint8_t *bg);
 
 /* -- images -------------------------------------------------------------- */
 AlmzImg *almz_img_new(int w, int h);                  /* zeroed */
