@@ -257,3 +257,11 @@
         (px/save-image! img [] {:path path :format :jpeg :quality 90 :meta {:make "X" :iso 100}})
         (is (= {:make "X" :iso 100} (select-keys (px/read-meta path) [:make :iso])))))
     (px/free-image! img)))
+
+(deftest native-abi
+  (testing "the library matches the struct layouts this code writes"
+    (is (nil? (px/abi-problem))))
+  (testing "a mismatch names both versions and the fix"
+    (let [msg (px/abi-problem (inc px/abi))]
+      (is (re-find #"rebuild" msg))
+      (is (re-find (re-pattern (str (inc px/abi))) msg)))))

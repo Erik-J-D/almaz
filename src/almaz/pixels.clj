@@ -50,10 +50,29 @@
   [:pointer :pointer :int32 :pointer :int32 :int32 :pointer :pointer] :int32 :blocking)
 (ffi/defcfn meta-read*      "almz_meta_read"      [:pointer :pointer] :int32 :blocking)
 (ffi/defcfn free-string*    "almz_free_string"    [:pointer] :void)
+(ffi/defcfn abi*           "almz_abi"            [] :int32)
 (ffi/defcfn tone-lut*       "almz_tone_lut"       [:pointer :pointer] :void)
 (ffi/defcfn tone-apply*     "almz_tone_apply"     [:pointer :pointer] :void)
 (ffi/defcfn histogram*      "almz_histogram"      [:pointer :pointer :int32 :pointer] :void :blocking)
 (ffi/defcfn histogram-draw* "almz_histogram_draw" [:pointer :int32 :int32 :pointer :pointer] :void)
+
+;; ---- layout check ------------------------------------------------------------
+(def abi
+  "The native struct layouts this namespace writes (ALMZ_ABI in almazimg.h)."
+  2)
+
+(defn abi-problem
+  "Why the loaded libalmazimg can't be used with this code, or nil. A built
+   binary loads the library from where it was built, so rebuilding one
+   without the other passes structs of the wrong shape (a crash, not an
+   error)."
+  ([] (abi-problem (abi*)))
+  ([lib]
+   (when (not= lib abi)
+     (str "libalmazimg has struct layout " lib " but this build writes " abi
+          ": rebuild them together (native/img/build.sh, then the app)"))))
+
+(when-let [p (abi-problem)] (throw (ex-info p {:lib (abi*) :expected abi})))
 
 ;; ---- errors ------------------------------------------------------------------
 (defn- call-with-err

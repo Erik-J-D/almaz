@@ -71,6 +71,11 @@ void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int nlayers, u
  * w x h buffer `out`, over `bg`. */
 void almz_histogram_draw(const uint32_t *hist, int w, int h, uint8_t *out, const uint8_t *bg);
 
+/* Bumped whenever a struct the caller fills (AlmzLayer, AlmzTone, AlmzMeta)
+ * changes shape: a caller built against another layout must not run. */
+#define ALMZ_ABI 2
+int almz_abi(void);
+
 /* -- images -------------------------------------------------------------- */
 AlmzImg *almz_img_new(int w, int h);                  /* zeroed */
 AlmzImg *almz_img_wrap(int w, int h, uint16_t *data); /* takes ownership (malloc'd) */

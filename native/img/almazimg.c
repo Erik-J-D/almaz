@@ -26,6 +26,7 @@ static void set_err(char **err, const char *msg) {
   if (err) *err = dupstr(msg);
 }
 void almz_free_string(char *s) { free(s); }
+int almz_abi(void) { return ALMZ_ABI; }
 
 /* ---- parallel for ------------------------------------------------------ */
 typedef void (*job_fn)(void *ctx, int i0, int i1);
