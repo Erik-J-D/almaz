@@ -15,8 +15,8 @@ if [ "$(uname)" = "Darwin" ]; then
     -L"$ORT_LIB" -lonnxruntime
   echo "built lib/libalmazinfer_onnxruntime.dylib"
 else
-  ORT_INC="${ONNXRUNTIME_INC:?set ONNXRUNTIME_INC to the release's include dir}"
-  ORT_LIB="${ONNXRUNTIME_LIB:?set ONNXRUNTIME_LIB to the release's lib dir}"
+  ORT_INC="${ONNXRUNTIME_INC:?set ONNXRUNTIME_INC to the include dir of the release}"
+  ORT_LIB="${ONNXRUNTIME_LIB:?set ONNXRUNTIME_LIB to the lib dir of the release}"
   g++ -shared -fPIC -std=c++17 -O2 -I"$ORT_INC" \
     -o lib/libalmazinfer_onnxruntime.so almazinfer_onnxruntime.cpp \
     -L"$ORT_LIB" -lonnxruntime -Wl,-rpath,"$ORT_LIB"
