@@ -13,19 +13,34 @@ See [PLAN.md](PLAN.md) for the target analysis and plan.
   JPEG / PNG / TIFF (8 and 16 bit). The camera's embedded preview shows while
   the RAW decodes. RAW files keep the exposure they were shot at: no
   automatic brightening.
-- **Filters are layers.** Each layer (Denoise, Sharpen) runs over the composite
-  of the layers below it and blends back through its **strength** and its own
-  **mask**. Masks are painted with a soft round brush (size, hardness) and have
-  a **feather** (gaussian) so edges blend smoothly into the layer below; Fill,
-  Clear and Invert act on the whole mask.
-- **Light** layers adjust exposure (EV), contrast, highlights, shadows,
-  whites, blacks and saturation. They're computed as they're drawn, so the
-  sliders respond at once, and they mask and blend like the filters. Auto
-  exposure lifts the image until its brightest 1% reaches white (what raw
-  converters apply by default), on request. A histogram of the result sits
-  above the navigator.
-- **Autopilot** measures noise and sharpness when an image opens and adds the
-  layers it needs at suggested strengths.
+- **Filters are layers**, one of each, at a fixed place in the pipeline and
+  switched on and off from their panel's header (changing a setting switches
+  it on). Each runs over the composite of the layers below it and blends back
+  through its **strength** and its own **mask**. Masks are painted with a soft
+  round brush (size, hardness) and have a **feather** (gaussian) so edges blend
+  smoothly into the layer below; Fill, Clear and Invert act on the whole mask.
+- The sidebar has three tabs. **Enhance**: Denoise and Sharpen. **Color**:
+  Light (exposure, contrast, highlights, shadows, whites, blacks, saturation,
+  auto exposure), Levels (black/grey/white per channel over a histogram, with
+  pickers), Color Balance (cyan/red, magenta/green, yellow/blue, saturation
+  and brightness for shadows, midtones and highlights), Hue & Saturation (with
+  vibrance), Selective Color (hue, saturation, brightness for eight hue
+  bands), Black & White (channel mix, toning, intensity) and Vignette. The
+  colour maths follows darktable's modules (rgblevels, colorbalancergb,
+  colorequal, channelmixerrgb, vignette), written in Clojure (`almaz.color`)
+  and drawn as 3D colour tables or per-channel curves, so the sliders respond
+  as they move. **Dimensions**: rotate and flip, and crop by dragging a frame
+  on the image, free, to an aspect ratio (original, presets, custom) or to a
+  size (custom, presets). Nothing is resampled until export. A histogram of
+  the result sits above the navigator.
+- **Autopilot** measures noise and sharpness when an image opens and switches
+  on the filters it needs at suggested strengths.
+- On macOS the picture on screen (the layer stack, colour adjustments,
+  masks, crop and rotation) and the histograms are drawn on the GPU with
+  Metal, falling back to the CPU without one (`ALMAZ_GPU=0` forces it);
+  exports are always composited on the CPU at full precision. The AI filters
+  run on the GPU through Core ML (ONNX Runtime's Core ML provider), which
+  takes the whole NAFNet graph.
 - Processing is tiled (512 px, crossfaded overlaps, no seams) and starts at
   the part of the image being viewed. Edits re-run only what they invalidate:
   a filter's settings re-run it and the layers above; its strength, mask or
@@ -37,7 +52,7 @@ See [PLAN.md](PLAN.md) for the target analysis and plan.
   100%.
 - Filmstrip of opened images; only the current one keeps full-resolution
   pixels.
-- Export the full-resolution composite as JPEG, 16-bit TIFF, or 8/16-bit PNG,
+- Export the full-resolution composite, cropped and turned, as JPEG, 16-bit TIFF, or 8/16-bit PNG,
   keeping the photo's shooting metadata (camera, lens, exposure, aperture, ISO,
   focal length, capture time) as EXIF. It is read from the source's own EXIF
   (JPEG, PNG, and TIFF-based RAW such as NEF/ARW/DNG/CR2) or, for other RAW
@@ -50,9 +65,11 @@ denoise ~45 s, sharpen ~45 s for the whole frame, export ~6 s.
 
 Documents and their filter layers live in a [relatum](https://github.com/yogthos/relatum)
 database (`almaz.doc`): `:doc` and `:layer` tables with typed columns, checks
-(status and kind sets, opacity in [0, 1]), a cascading foreign key from
-layers to their document, and one layer per position in a document's stack
-(`:unique [[:doc-id :position]]`). Functions take the db and return the new one; the
+(status and kind sets, opacity and every colour setting in range), a
+cascading foreign key from layers to their document, and one layer of each
+kind, at its kind's position, in a document's stack
+(`:unique [[:doc-id :position] [:doc-id :kind]]`). A document's orientation and
+crop are columns of its row (`almaz.geom`). Functions take the db and return the new one; the
 app keeps it in one reactive cell (`almaz.state/db*`). UI-only state (view,
 tool, selection, job progress) stays in plain cells.
 
@@ -62,7 +79,8 @@ tool, selection, job progress) stays in plain cells.
 src/almaz/
   core.clj              the app: layout + -main
   ui/canvas.clj         image pane: rendering, overlays, pan/zoom/brush input
-  ui/sidebar.clj        histogram, navigator, autopilot, layer panels + mask tools
+  ui/sidebar.clj        histogram, navigator, autopilot, the Enhance / Color /
+                        Dimensions tabs + mask tools
   ui/chrome.clj         top bar, status bar, filmstrip
   ui/units.clj          sizes in widget units (HiDPI)
   state.clj             reactive state: the relatum db + UI cells
@@ -72,6 +90,9 @@ src/almaz/
   lifecycle.clj         native memory ownership (frees on the UI thread)
   doc.clj               data model: relatum tables (:doc, :layer), staleness
   view.clj              viewport math (pure)
+  geom.clj              orientation, crop, display <-> source mapping (pure)
+  color.clj             colour adjustments and their tables (pure)
+  tables.clj            colour tables built off the UI thread
   autopilot.clj         estimates -> layers (pure)
   engine.clj            runs one layer over the composite, tile by tile
   models.clj            model registry + sessions
@@ -81,7 +102,8 @@ src/almaz/
                         ONNX Runtime + Core ML backends
 native/
   img/                  pixel engine (C): 16-bit images + mip pyramid, masks,
-                        compositing, tiles, filters, estimators, file I/O
+                        compositing, tiles, filters, estimators, file I/O;
+                        almazimg_metal.m draws the composite with Metal
   onnxruntime/          C++ shim over ONNX Runtime (CPU, CoreML, CUDA EPs)
   raw/                  C++ shim over LibRaw
   coreml/               ObjC++ shim over Core ML (.mlmodelc)

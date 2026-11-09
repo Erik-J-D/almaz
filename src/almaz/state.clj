@@ -5,16 +5,21 @@
    other cells are UI state: what is selected, how it is viewed, the brush,
    and what the worker is doing."
   (:require [glimmer.ratom :as r]
-            [almaz.doc :as d])
+            [almaz.doc :as d]
+            [almaz.geom :as g])
   (:import (java.util.concurrent LinkedBlockingQueue TimeUnit)))
 
 (defonce db* (r/atom (d/empty-db)))
 (defonce current* (r/atom nil))   ; id of the doc being edited
 (defonce view* (r/atom {:mode :single :cw 800 :ch 600 :scale 0.1 :ox 0.0 :oy 0.0
                         :zoom :fit :split 0.5}))
-;; :mode :pan | :paint | :erase; :layer the layer whose mask the brush edits
+;; :mode :pan | :paint | :erase | :pick; :layer the layer whose mask the brush
+;; edits; :pick the levels point a click on the image sets (:black :grey :white)
 (defonce tool* (r/atom {:mode :pan :layer nil :radius 150.0 :hardness 0.5 :flow 1.0
-                        :show-mask true}))
+                        :show-mask true :pick nil}))
+;; the sidebar tab (:enhance :color :dimensions); on :dimensions the image
+;; pane edits the crop (the whole image shows, the crop as a frame over it)
+(defonce tab* (r/atom :enhance))
 (defonce job* (r/atom nil))       ; {:label :done :total} while the worker is busy
 (defonce message* (r/atom "Add images to begin"))
 (defonce autopilot* (r/atom true))
@@ -41,6 +46,13 @@
 (defn current-doc [] (d/doc @db* @current*))
 (defn layers [doc-id] (d/layers @db* doc-id))
 (defn layer [id] (d/layer @db* id))
+
+(defn editing-crop? [] (= :dimensions @tab*))
+
+(defn display-size
+  "The size the image pane shows the doc at (almaz.geom), once known."
+  [doc]
+  (when (:w doc) (g/display-size doc (editing-crop?))))
 
 ;; ---- writing -----------------------------------------------------------------
 (defn swap-db!

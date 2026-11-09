@@ -3,6 +3,7 @@
    status bar (progress, size, zoom) and the filmstrip."
   (:require [almaz.actions :as act]
             [almaz.doc :as d]
+            [almaz.geom :as g]
             [almaz.state :as s]
             [almaz.loading :as load]
             [almaz.ui.units :refer [px]]
@@ -61,7 +62,8 @@
                :on-click #(some-> @s/current* act/remove-doc!)}]
      [:label {:text @s/message* :weight 1}]
      (when job (job-progress job))
-     (when (:w doc) [:label {:text (str "W " (:w doc) "  H " (:h doc)) :weight 0}])
+     (when-let [[w h] (when (:w doc) (g/display-size doc false))]
+       [:label {:text (str "W " w "  H " h) :weight 0}])
      [:label {:text (v/zoom-label view) :weight 0}]
      (zoom-menu view)]))
 

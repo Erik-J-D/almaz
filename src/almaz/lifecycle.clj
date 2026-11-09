@@ -75,8 +75,8 @@
    strengths, and remember it ran."
   [db doc-id]
   (reduce (fn [acc {:keys [kind opacity]}]
-            (let [[acc' lid] (d/add-layer acc doc-id kind)]
-              (d/update-layer acc' lid assoc :opacity opacity)))
+            (let [[acc' lid] (d/ensure-layer acc doc-id kind)]
+              (d/update-layer acc' lid assoc :opacity opacity :enabled true)))
           (d/update-doc db doc-id assoc :autopiloted true)
           (ap/suggest (d/estimate (d/doc db doc-id)))))
 

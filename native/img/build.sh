@@ -6,9 +6,12 @@ cd "$(dirname "$0")"
 mkdir -p lib
 if [ "$(uname)" = "Darwin" ]; then
   P="${HOMEBREW_PREFIX:-/opt/homebrew}"
-  clang -dynamiclib -std=c11 -O3 -Wall -Wno-unused-function \
-    -I"$P/include" -o lib/libalmazimg.dylib almazimg.c exif.c sha256.c \
-    -L"$P/lib" -ljpeg -lpng16 -ltiff -lm -lpthread
+  # almazimg_metal.m: renders on the GPU (falls back to the CPU without one)
+  clang -c -std=c11 -O3 -Wall -Wno-unused-function -I"$P/include" -o lib/almazimg.o almazimg.c
+  clang -c -O3 -Wall -fobjc-arc -o lib/almazimg_metal.o almazimg_metal.m
+  clang -dynamiclib -O3 -I"$P/include" -o lib/libalmazimg.dylib lib/almazimg.o lib/almazimg_metal.o exif.c sha256.c \
+    -L"$P/lib" -ljpeg -lpng16 -ltiff -lm -lpthread -framework Metal -framework Foundation
+  rm -f lib/almazimg.o lib/almazimg_metal.o
   echo "built lib/libalmazimg.dylib"
 else
   cc -shared -fPIC -std=gnu11 -O3 -Wall -Wno-unused-function \

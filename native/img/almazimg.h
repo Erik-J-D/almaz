@@ -24,6 +24,7 @@ typedef struct AlmzImg {
   int w, h, nlev;
   int lw[ALMZ_MAX_LEV], lh[ALMZ_MAX_LEV];
   uint16_t *lev[ALMZ_MAX_LEV];
+  uint64_t uid, rev; /* unique per image; bumped on every pixel change (GPU caches) */
 } AlmzImg;
 
 /* A layer mask at 1/div of the image resolution. `paint` holds what the brush
@@ -35,14 +36,22 @@ typedef struct AlmzMask {
   float feather;     /* gaussian sigma, image pixels */
   float *paint;
   float *soft;
+  uint64_t uid, rev; /* as AlmzImg's */
 } AlmzMask;
 
 /* One entry of a layer stack: the filter's output image, its mask (NULL =
  * everywhere) and opacity. Layer i blends over the composite of layers < i:
  *   c = c + (img - c) * opacity * mask
- * An adjustment layer has no image: `lut` (ALMZ_TONE_N entries, from
- * almz_tone_lut) maps each channel of the composite below and `saturation`
- * then scales its colour, and that result takes img's place. */
+ * An adjustment layer has no image; its colour transform of the composite
+ * below takes img's place, in this order (each part optional):
+ *   lut     3 x ALMZ_TONE_N per-channel curves (r, then g, then b) over 0..1
+ *   saturation  scales the colour about its luma
+ *   cube    cube_n^3 RGB triples (r index fastest): an RGB -> RGB map of
+ *           display values 0..1, interpolated trilinearly
+ * `radial` = {cx, cy, rx, ry, inner, falloff} (source pixels) further weights
+ * the blend by distance from (cx, cy) in radii d: 0 within `inner`, rising as
+ * a raised cosine to 1 at inner + falloff (darktable's vignette). rx <= 0:
+ * no radial weight. */
 typedef struct AlmzLayer {
   const AlmzImg *img;
   const AlmzMask *mask;
@@ -50,6 +59,9 @@ typedef struct AlmzLayer {
   int32_t enabled;
   const float *lut;
   float saturation;
+  int32_t cube_n;
+  const float *cube;
+  float radial[6];
 } AlmzLayer;
 
 /* Light adjustments. exposure in EV (linear light x 2^EV); the rest -1..1,
@@ -65,15 +77,17 @@ void almz_tone_lut(const AlmzTone *t, float *lut);
 void almz_tone_apply(const AlmzTone *t, float *rgb);
 
 /* 256-bin histograms of the composite (r, g, b, then Rec. 709 luma, each 256
- * counts) from the finest pyramid level of at most ~1.5 MP. */
-void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int nlayers, uint32_t *out);
+ * counts) from the finest pyramid level of at most ~1.5 MP, within the
+ * source rect `clip` {x, y, w, h} (NULL: all of it). */
+void almz_histogram(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
+                    const int32_t *clip, uint32_t *out);
 /* Draw `hist` (almz_histogram's) as overlapping RGB areas into the RGBA8
  * w x h buffer `out`, over `bg`. */
 void almz_histogram_draw(const uint32_t *hist, int w, int h, uint8_t *out, const uint8_t *bg);
 
 /* Bumped whenever a struct the caller fills (AlmzLayer, AlmzTone, AlmzMeta)
  * changes shape: a caller built against another layout must not run. */
-#define ALMZ_ABI 2
+#define ALMZ_ABI 3
 int almz_abi(void);
 
 /* -- images -------------------------------------------------------------- */
@@ -108,14 +122,23 @@ float almz_mask_sample(const AlmzMask *m, double x, double y);
 
 /* -- rendering ----------------------------------------------------------- */
 /* Render the layer stack into the RGBA8 rectangle (rx, ry, rw, rh) of `out`
- * (out_w x out_h, tightly packed). Screen = image * scale + (ox, oy).
- * `overlay` (may be NULL) tints the feathered mask with tint[0..2] at
- * strength tint[3]. Pixels outside the image get `bg` (RGBA). */
+ * (out_w x out_h, tightly packed). `xf` {a, b, c, d, e, f} maps a screen
+ * point to source pixels: ix = a sx + b sy + c, iy = d sx + e sy + f (the
+ * view, orientation and crop in one). Pixels mapping outside the source rect
+ * `clip` {x, y, w, h} (NULL: the image) get `bg` (RGBA). `overlay` (may be
+ * NULL) tints the feathered mask with tint[0..2] at strength tint[3]. */
 void almz_render(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
-                 double ox, double oy, double scale,
+                 const double *xf, const int32_t *clip,
                  const AlmzMask *overlay, const float *tint,
                  uint8_t *out, int out_w, int out_h,
                  int rx, int ry, int rw, int rh, const uint8_t *bg);
+
+/* Render on the GPU (Metal, macOS) when it can, else on the CPU; the two
+ * agree to within rounding. Exports, histograms and tiles always use the
+ * CPU. Off: almz_render always draws on the CPU (tests compare the two). */
+void almz_gpu_set_enabled(int on);
+/* 1 when renders go to the GPU (enabled and a Metal device is present). */
+int almz_gpu_active(void);
 
 /* Write the full-resolution composite of base + layers into `dst` (same size). */
 void almz_composite_into(AlmzImg *dst, const AlmzImg *base, const AlmzLayer *layers, int nlayers);
@@ -174,9 +197,12 @@ AlmzImg *almz_load(const char *path, char **err);
 AlmzImg *almz_load_jpeg_mem(const uint8_t *data, size_t len, char **err);
 AlmzImg *almz_from_rgb8(const uint8_t *rgb, int w, int h);
 /* Write the composite of base + layers at full resolution, streaming rows,
- * with `meta` (may be NULL) as EXIF. quality is JPEG quality 1..100. 0 on
+ * with `meta` (may be NULL) as EXIF. quality is JPEG quality 1..100. The
+ * output is out_w x out_h; `xf` maps its pixel centres to source pixels
+ * (orientation and crop; NULL with out_w/out_h 0: the image as is). 0 on
  * success. */
 int almz_save(const AlmzImg *base, const AlmzLayer *layers, int nlayers,
+              const double *xf, int out_w, int out_h,
               const char *path, int format, int quality, const AlmzMeta *meta, char **err);
 void almz_free_string(char *s);
 

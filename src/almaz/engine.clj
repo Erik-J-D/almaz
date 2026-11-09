@@ -6,20 +6,28 @@
    the result shows up where the user is looking and grows outwards. All pixel
    work is native: tile extraction (which composites the layers below on the
    fly), inference straight from native buffers, and the crossfaded write."
-  (:require [almaz.doc :as d]
+  (:require [almaz.color :as c]
+            [almaz.doc :as d]
+            [almaz.geom :as g]
             [almaz.infer.protocol :as p]
             [almaz.infer.tile :as tile]
             [almaz.pixels :as px]
             [jolt.ffi :as ffi]))
 
 (defn layer-refs
-  "A doc's layers as the pixel engine's stack entries (light layers carry
-   their adjustments as :tone)."
-  [layers]
-  (mapv (fn [{:keys [img mask opacity enabled] :as l}]
-          (cond-> {:img img :mask mask :opacity opacity :enabled enabled}
-            (d/tone l) (assoc :tone (d/tone l))))
-        layers))
+  "Doc `doc`'s `layers` as the pixel engine's stack entries: light layers
+   carry their adjustments as :tone, colour adjustments their tables
+   (almaz.color/table, or `:table` (fn [layer kind settings]) to look them
+   up some other way), the vignette its radial weight around the crop."
+  ([doc layers] (layer-refs doc layers nil))
+  ([doc layers {:keys [table] :or {table (fn [_ kind p] (c/table kind p))}}]
+   (mapv (fn [{:keys [img mask opacity enabled kind] :as l}]
+           (let [[ck cp] (d/colour l)]
+             (cond-> {:img img :mask mask :opacity opacity :enabled enabled}
+               (d/tone l) (assoc :tone (d/tone l))
+               ck (merge (when enabled (table l ck cp)))
+               (and (= :vignette kind) doc (:w doc)) (assoc :radial (c/radial cp (g/crop-rect doc))))))
+         layers)))
 
 (defn- model-op [{:keys [backend session spec]} detail]
   (let [{:keys [block overlap inputs outputs]} spec

@@ -13,6 +13,7 @@
   (:require [glimmer.backend :as b]
             [almaz.doc :as d]
             [almaz.engine :as eng]
+            [almaz.geom :as g]
             [almaz.lifecycle :as life]
             [almaz.loading :as load]
             [almaz.models :as models]
@@ -69,7 +70,13 @@
   [{:keys [id base]} {:keys [lid sig result mask-rev]}]
   (s/swap-layer! lid assoc :done-sig sig :partial-rev (when (= :partial result) mask-rev))
   (when (d/processed? @s/db* id)
-    (load/set-thumb! id base (eng/layer-refs (s/layers id)) (d/output-signature @s/db* id))))
+    (load/set-thumb! id base (eng/layer-refs (s/doc id) (s/layers id)) (d/output-signature @s/db* id))))
+
+(defn- focus
+  "The source point at the centre of the image pane: tiles start there."
+  [dc]
+  (let [[dw dh] (or (s/display-size dc) [(:w dc) (:h dc)])]
+    (g/apply-xf (g/display->source dc (s/editing-crop?)) (v/focus @s/view* dw dh))))
 
 (defn- run-layer!
   "Run the job's tiles; record the result unless it was cancelled."
@@ -79,7 +86,7 @@
         t0 (s/now)
         result (eng/process! {:base base :below below :out out :mask (:mask layer)
                               :op (eng/op-for layer (session-for layer label))
-                              :focus (v/focus @s/view* w h)
+                              :focus (focus dc)
                               :progress (report-progress label)
                               :cancelled? #(not= sig (live-sig id lid))})]
     (when (#{:done :partial} result)
@@ -89,7 +96,7 @@
 (defn- process-layer! [{:keys [id base] :as dc} idx]
   (let [ls (s/layers id)
         layer (nth ls idx)
-        below (eng/layer-refs (take idx ls))
+        below (eng/layer-refs dc (take idx ls))
         out (layer-output! dc layer below)]
     ;; from the first tile written, the old output is no longer valid for any
     ;; signature: a cancelled run must leave the layer stale
@@ -102,14 +109,18 @@
       (finally (life/released!)))))
 
 ;; ---- export --------------------------------------------------------------------
-(defn- export! [{:keys [path quality] fmt :format} {:keys [id base name]}]
+(defn- export!
+  "Write the doc's picture, oriented and cropped."
+  [{:keys [path quality] fmt :format} {:keys [id base name]}]
   (reset! s/job* {:label (str "Exporting " name)})
-  (let [ls (s/layers id)]
+  (let [ls (s/layers id)
+        dc (s/doc id)]
     (life/using! (concat [base] (map :img ls) (map :mask ls)))
     (try
       (let [t0 (s/now)]
-        (px/save-image! base (eng/layer-refs ls)
-                        {:path path :format fmt :quality quality :meta (d/exif @s/db* id)})
+        (px/save-image! base (eng/layer-refs dc ls)
+                        {:path path :format fmt :quality quality :meta (d/exif @s/db* id)
+                         :xf (g/display->source dc false) :size (g/display-size dc false)})
         (s/message! (format "Exported %s (%.1fs)" path (/ (- (s/now) t0) 1000.0))))
       (finally
         (reset! s/export-req* nil)

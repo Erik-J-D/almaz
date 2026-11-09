@@ -29,7 +29,7 @@
 (ffi/defcfn mask-sample*    "almz_mask_sample"    [:pointer :double :double] :float)
 
 (ffi/defcfn render*         "almz_render"
-  [:pointer :pointer :int32 :double :double :double :pointer :pointer
+  [:pointer :pointer :int32 :pointer :pointer :pointer :pointer
    :pointer :int32 :int32 :int32 :int32 :int32 :int32 :pointer] :void)
 
 (ffi/defcfn composite-into* "almz_composite_into" [:pointer :pointer :pointer :int32] :void :blocking)
@@ -47,19 +47,21 @@
 (ffi/defcfn load-jpeg-mem*  "almz_load_jpeg_mem"  [:pointer :size_t :pointer] :pointer :blocking)
 (ffi/defcfn from-rgb8*      "almz_from_rgb8"      [:pointer :int32 :int32] :pointer :blocking)
 (ffi/defcfn save*           "almz_save"
-  [:pointer :pointer :int32 :pointer :int32 :int32 :pointer :pointer] :int32 :blocking)
+  [:pointer :pointer :int32 :pointer :int32 :int32 :pointer :int32 :int32 :pointer :pointer] :int32 :blocking)
 (ffi/defcfn meta-read*      "almz_meta_read"      [:pointer :pointer] :int32 :blocking)
 (ffi/defcfn free-string*    "almz_free_string"    [:pointer] :void)
 (ffi/defcfn abi*           "almz_abi"            [] :int32)
 (ffi/defcfn tone-lut*       "almz_tone_lut"       [:pointer :pointer] :void)
 (ffi/defcfn tone-apply*     "almz_tone_apply"     [:pointer :pointer] :void)
-(ffi/defcfn histogram*      "almz_histogram"      [:pointer :pointer :int32 :pointer] :void :blocking)
+(ffi/defcfn gpu-set-enabled* "almz_gpu_set_enabled" [:int32] :void)
+(ffi/defcfn gpu-active*     "almz_gpu_active"     [] :int32)
+(ffi/defcfn histogram*      "almz_histogram"      [:pointer :pointer :int32 :pointer :pointer] :void :blocking)
 (ffi/defcfn histogram-draw* "almz_histogram_draw" [:pointer :int32 :int32 :pointer :pointer] :void)
 
 ;; ---- layout check ------------------------------------------------------------
 (def abi
   "The native struct layouts this namespace writes (ALMZ_ABI in almazimg.h)."
-  2)
+  3)
 
 (defn abi-problem
   "Why the loaded libalmazimg can't be used with this code, or nil. A built
@@ -162,22 +164,45 @@
       (mapv double (ffi/read-array c :float 3)))))
 
 ;; ---- layer stacks ------------------------------------------------------------
+;; An entry is {:img :mask :opacity :enabled} for a filter's output, or an
+;; adjustment computed as it is drawn: :tone (light adjustments, the curve
+;; tabulated here), :curves (3 x 4096 floats, per channel), :cube {:n :data}
+;; (an n^3 RGB map, almaz.color), :radial [cx cy rx ry inner falloff].
 (def ^:private layer-layout
   (ffi/layout [:struct [[:img :pointer] [:mask :pointer] [:opacity :float] [:enabled :int32]
-                        [:lut :pointer] [:saturation :float]]]))
+                        [:lut :pointer] [:saturation :float]
+                        [:cube-n :int32] [:cube :pointer] [:radial [:array :float 6]]]]))
 (def ^:private layer-size (ffi/sizeof layer-layout))
 
+(defn- floats [arena ^floats a]
+  (doto (ffi/alloc arena (* 4 (alength a))) (ffi/write-array :float a)))
+
+(defn- curve-table
+  "The layer's per-channel curves in `arena`: :curves as given, or the light
+   adjustments' one curve for all three channels."
+  [arena {:keys [tone curves]}]
+  (cond
+    curves (floats arena curves)
+    tone (let [p (ffi/alloc arena (* 3 4 tone-n))]
+           (tone-lut* (write-tone arena tone) p)
+           (ffi/copy p (+ p (* 4 tone-n)) (* 4 tone-n))
+           (ffi/copy p (+ p (* 8 tone-n)) (* 4 tone-n))
+           p)))
+
 (defn- layer-struct
-  "One layer's AlmzLayer fields. A layer with :tone (light adjustments) gets
-   its curve tabulated into `arena`."
-  [arena {:keys [img mask opacity enabled tone]}]
-  (let [lut (when tone
-              (doto (ffi/alloc arena (* 4 tone-n)) (->> (tone-lut* (write-tone arena tone)))))]
+  "One layer's AlmzLayer fields, its tables written into `arena`."
+  [arena {:keys [img mask opacity enabled tone cube radial] :as l}]
+  (let [lut (curve-table arena l)
+        cube-p (when cube (floats arena (:data cube)))
+        sat (float (get tone :saturation 0.0))]
     {:img (or img ffi/null) :mask (or mask ffi/null)
      :opacity (float (or opacity 1.0))
-     :enabled (if (and enabled (or img lut)) 1 0)
+     :enabled (if (and enabled (or img lut cube-p (not (zero? sat)))) 1 0)
      :lut (or lut ffi/null)
-     :saturation (float (get tone :saturation 0.0))}))
+     :saturation sat
+     :cube-n (int (if cube-p (:n cube) 0))
+     :cube (or cube-p ffi/null)
+     :radial (mapv float (or radial [0 0 0 0 0 0]))}))
 
 (defn- write-layers
   "An AlmzLayer array for `layers` in `arena` (NULL when empty)."
@@ -190,33 +215,42 @@
       arr)))
 
 ;; ---- histogram ---------------------------------------------------------------
+(defn- ints [arena xs]
+  (when xs
+    (doto (ffi/alloc arena (* 4 (count xs))) (ffi/write-array :int32 (int-array (map #(Math/round (double %)) xs))))))
+
+(defn- doubles* [arena xs]
+  (doto (ffi/alloc arena (* 8 (count xs))) (ffi/write-array :double (double-array (map double xs)))))
+
 (defn histogram
-  "256-bin histograms of the composite: {:r :g :b :l (Rec. 709 luma)}."
-  [base layers]
+  "256-bin histograms of the composite: {:r :g :b :l (Rec. 709 luma)},
+   within the source rect `clip` [x y w h] (default: all of it)."
+  [base layers & [clip]]
   (with-open [a (ffi/confined-arena)]
     (let [out (ffi/alloc a (* 4 4 256))]
-      (histogram* base (write-layers a layers) (int (count layers)) out)
+      (histogram* base (write-layers a layers) (int (count layers)) (or (ints a clip) ffi/null) out)
       (let [v (vec (ffi/read-array out :uint32 (* 4 256)))]
         {:r (subvec v 0 256) :g (subvec v 256 512) :b (subvec v 512 768) :l (subvec v 768 1024)}))))
 
 (defn draw-histogram!
   "Compute the composite's histogram and draw it into the RGBA8 w x h buffer
    `out` over `bg` [r g b a]."
-  [base layers {:keys [out w h bg]}]
+  [base layers {:keys [out w h bg clip]}]
   (with-open [a (ffi/confined-arena)]
     (let [hist (ffi/alloc a (* 4 4 256))
           bgp (ffi/alloc a 4)]
       (ffi/write-array bgp (byte-array (map unchecked-byte (or bg [0 0 0 255]))))
-      (histogram* base (write-layers a layers) (int (count layers)) hist)
+      (histogram* base (write-layers a layers) (int (count layers)) (or (ints a clip) ffi/null) hist)
       (histogram-draw* hist (int w) (int h) out bgp))))
 
 ;; ---- rendering ---------------------------------------------------------------
 (defn render!
   "Render base + layers into the RGBA8 buffer `out` (out-w x out-h), within
-   :rect [x y w h] (default: all of it). Screen = image * scale + (ox, oy).
-   :overlay is a mask drawn as :tint [r g b strength]; :bg the RGBA outside
-   the image."
-  [base layers {:keys [ox oy scale overlay tint out out-w out-h rect bg]}]
+   :rect [x y w h] (default: all of it). :xf maps screen to source pixels
+   (almaz.geom's affine); or screen = image * :scale + (:ox, :oy). Outside
+   the source rect :clip (default: the image) is :bg. :overlay is a mask
+   drawn as :tint [r g b strength]."
+  [base layers {:keys [xf clip ox oy scale overlay tint out out-w out-h rect bg]}]
   (with-open [a (ffi/confined-arena)]
     (let [[rx ry rw rh] (or rect [0 0 out-w out-h])
           larr (write-layers a layers)
@@ -225,9 +259,19 @@
           bgp (let [p (ffi/alloc a 4)
                     [r g b al] (or bg [0 0 0 255])]
                 (ffi/write-array p (byte-array (map unchecked-byte [r g b al]))) p)]
-      (render* base larr (int (count layers)) (double ox) (double oy) (double scale)
+      (render* base larr (int (count layers))
+               (doubles* a (or xf (let [s (double scale)] [(/ 1.0 s) 0.0 (/ (- ox) s) 0.0 (/ 1.0 s) (/ (- oy) s)])))
+               (or (ints a clip) ffi/null)
                (or overlay ffi/null) (or tp ffi/null)
                out (int out-w) (int out-h) (int rx) (int ry) (int rw) (int rh) bgp))))
+
+(defn gpu?
+  "Do renders go to the GPU (Metal on macOS; ALMAZ_GPU=0 turns it off)?"
+  [] (= 1 (gpu-active*)))
+
+(defn set-gpu!
+  "Render on the GPU when there is one (true), or always on the CPU."
+  [on?] (gpu-set-enabled* (if on? 1 0)))
 
 ;; ---- full-image composite ---------------------------------------------------
 (defn composite-into!
@@ -342,8 +386,10 @@
   "Write the full-resolution composite to `path` as `format` (see `formats`),
    with `meta` (read-meta's map) embedded as EXIF. The file is written to
    `path`.part and renamed when complete: a large export takes seconds, and
-   anything opening `path` meanwhile would read a truncated image."
-  [base layers {:keys [path quality meta] fmt :format}]
+   anything opening `path` meanwhile would read a truncated image. :xf and
+   :size [w h] give the output's geometry (output -> source pixels; default
+   the image as is)."
+  [base layers {:keys [path quality meta xf size] fmt :format}]
   (let [part (str path ".part")]
     (with-open [a (ffi/confined-arena)]
       (let [larr (write-layers a layers)
@@ -351,7 +397,9 @@
             mp (if meta (write-meta-struct a meta) ffi/null)]
         (try
           (call-with-err (str "cannot write " path)
-                         #(save* base larr (int (count layers)) cpath (int (formats fmt)) (int quality) mp %)
+                         #(save* base larr (int (count layers))
+                                 (if xf (doubles* a xf) ffi/null) (int (or (first size) 0)) (int (or (second size) 0))
+                                 cpath (int (formats fmt)) (int quality) mp %)
                          zero?)
           (catch Exception e
             (let [f (java.io.File. part)] (when (.isFile f) (.delete f)))
@@ -359,3 +407,18 @@
     (when-not (.renameTo (java.io.File. part) (java.io.File. path))
       (throw (ex-info (str "cannot write " path) {:path path})))
     path))
+
+;; ---- picking -----------------------------------------------------------------
+(defn sample
+  "The mean colour [r g b] (0..1) of base + layers over the (2r+1)^2 box
+   around source pixel (x, y) (the edges mirrored)."
+  [base layers [x y] r]
+  (let [n (inc (* 2 r))
+        cnt (* n n)
+        p (ffi/alloc (* 4 3 cnt))]
+    (try
+      (tile-extract! base layers {:x (- (long x) r) :y (- (long y) r) :w n :h n} p)
+      (let [v (ffi/read-array p :float (* 3 cnt))]
+        (mapv (fn [c] (/ (reduce + (map #(double (aget v (+ (* c cnt) %))) (range cnt))) cnt))
+              (range 3)))
+      (finally (ffi/free p)))))

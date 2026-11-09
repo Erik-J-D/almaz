@@ -113,6 +113,81 @@
         (px/free-mask! m)))
     (px/free-image! mid)))
 
+(defn- swap-cube
+  "An n^3 cube that swaps red and blue."
+  [n]
+  (let [a (float-array (* 3 n n n)) s (/ 1.0 (dec n))]
+    (dotimes [b n] (dotimes [g n] (dotimes [r n]
+      (let [i (* 3 (+ r (* n (+ g (* n b)))))]
+        (aset a i (float (* b s))) (aset a (+ i 1) (float (* g s))) (aset a (+ i 2) (float (* r s)))))))
+    a))
+
+(defn- render-at
+  "The rendered RGB of the pixel at image (x, y), 1:1."
+  [base layers x y]
+  (let [out (ffi/alloc 4)]
+    (px/render! base layers {:xf [1.0 0.0 (double x) 0.0 1.0 (double y)] :out out :out-w 1 :out-h 1})
+    (let [v (mapv #(bit-and 0xff %) (ffi/read-array out 3))]
+      (ffi/free out)
+      v)))
+
+(deftest colour-layers
+  (let [img (filled 16 16 (constantly [0.8 0.4 0.2]))]
+    (testing "a cube maps colours (trilinear between its points)"
+      (is (= [51 102 204] (render-at img [{:cube {:n 5 :data (swap-cube 5)} :opacity 1.0 :enabled true}] 8 8))))
+    (testing "per-channel curves: each channel its own"
+      (let [c (float-array (* 3 4096))]
+        ;; red: identity, green: 0, blue: 1
+        (dotimes [i 4096] (aset c i (float (/ i 4095.0))) (aset c (+ 8192 i) (float 1.0)))
+        (is (= [204 0 255] (render-at img [{:curves c :opacity 1.0 :enabled true}] 8 8)))))
+    (testing "a radial weight leaves the centre and reaches the corners"
+      (let [l [{:cube {:n 2 :data (swap-cube 2)} :radial [8 8 8 8 0.5 0.5] :opacity 1.0 :enabled true}]]
+        (is (= [204 102 51] (render-at img l 8 8)))
+        (is (= [51 102 204] (render-at img l 0 0)))))
+    (px/free-image! img)))
+
+;; test_lut3d_bounds.c: a table's size bounds every read of it. The cube's
+;; edges (inputs at 0 and 1) read its last points, nothing past them, and a
+;; cube too small to interpolate is ignored rather than read.
+(deftest cube-bounds
+  (let [corners (filled 2 2 (fn [x y] (if (= [x y] [0 0]) [0 0 0] [1 1 1])))
+        l (fn [n data] [{:cube {:n n :data data} :opacity 1.0 :enabled true}])]
+    (testing "black and white map to the cube's first and last points"
+      (is (= [255 255 255] (render-at corners (l 5 (doto (swap-cube 5) (aset 0 (float 1.0)) (aset 1 (float 1.0)) (aset 2 (float 1.0)))) 0 0)))
+      (let [c (swap-cube 3) last (- (alength c) 3)]
+        (dotimes [k 3] (aset c (+ last k) (float 0.0)))
+        (is (= [0 0 0] (render-at corners (l 3 c) 1 1)))))
+    (testing "a one-point cube is not interpolated"
+      (is (= [255 255 255] (render-at corners (l 1 (float-array [0 0 0])) 1 1))))
+    (px/free-image! corners)))
+
+(deftest transformed
+  (let [img (filled 4 2 (fn [x y] [(/ x 3.0) (/ y 1.0) 0]))]
+    (testing "an affine view: a quarter turn shows the bottom-left first"
+      ;; screen (0,0) -> source (0.5, 1.5): xf = [0 1 0 -1 0 2] on centres
+      (let [out (ffi/alloc 4)]
+        (px/render! img [] {:xf [0.0 1.0 0.0 -1.0 0.0 2.0] :out out :out-w 1 :out-h 1})
+        (is (= [0 255 0] (mapv #(bit-and 0xff %) (ffi/read-array out 3))))
+        (ffi/free out)))
+    (testing "outside the clip is background"
+      (let [out (ffi/alloc 4)]
+        (px/render! img [] {:xf [1.0 0.0 0.0 0.0 1.0 0.0] :clip [1 0 3 2] :bg [9 9 9 255]
+                            :out out :out-w 1 :out-h 1})
+        (is (= [9 9 9] (mapv #(bit-and 0xff %) (ffi/read-array out 3))))
+        (ffi/free out)))
+    (testing "the histogram counts only the clip"
+      (is (= 6 (reduce + (:r (px/histogram img [] [1 0 3 2]))))))
+    (testing "export writes the transformed size"
+      (let [path (str (System/getProperty "java.io.tmpdir") "/almaz-xf-test.png")]
+        (px/save-image! img [] {:path path :format :png8 :quality 90
+                                :xf [0.0 1.0 0.0 -1.0 0.0 2.0] :size [2 4]})
+        (let [back (px/load-image path)]
+          (is (= [2 4] [(px/width back) (px/height back)]))
+          (is (every? true? (map (partial close? 0.01) [0 1 0] (px/pixel back 0 0))))
+          (px/free-image! back))
+        (.delete (java.io.File. path))))
+    (px/free-image! img)))
+
 (deftest histograms
   (let [img (filled 64 32 (fn [x _] (if (< x 16) [0 0 0] [1 0.5 0])))
         {:keys [r g b l]} (px/histogram img [])]
@@ -265,3 +340,73 @@
     (let [msg (px/abi-problem (inc px/abi))]
       (is (re-find #"rebuild" msg))
       (is (re-find (re-pattern (str (inc px/abi))) msg)))))
+
+;; ---- GPU ----------------------------------------------------------------------
+;; The GPU renderer must draw what the CPU one draws (to rounding): every
+;; layer kind, masks, the overlay, a turned and clipped view, zoomed in and out.
+(defn- render-both
+  "[gpu cpu] RGBA bytes of the same render."
+  [img layers opts]
+  (let [{:keys [out-w out-h]} opts
+        go (fn [gpu?]
+             (px/set-gpu! gpu?)
+             (let [out (ffi/alloc (* 4 out-w out-h))]
+               (try (px/render! img layers (assoc opts :out out))
+                    (vec (ffi/read-array out (* 4 out-w out-h)))
+                    (finally (ffi/free out)))))]
+    (try [(go true) (go false)] (finally (px/set-gpu! true)))))
+
+(defn- max-diff* [a b] (reduce max 0 (map #(Math/abs (- (bit-and 0xff %1) (bit-and 0xff %2))) a b)))
+
+(deftest gpu-matches-cpu
+  (when (px/gpu?)
+    (let [w 300 h 200
+          img (filled w h (fn [x y] [(/ x (double w)) (/ y (double h)) (* 0.5 (+ 0.5 (Math/sin (* 0.1 (+ x y)))))]))
+          over (filled w h (fn [x _] [(if (even? (quot x 7)) 0.9 0.1) 0.3 0.6]))
+          m (doto (px/new-mask w h 4 0.0) (px/mask-feather! 6.0))
+          _ (px/stroke! m [80 100] [220 100] {:radius 50 :hardness 0.5})
+          curves (let [c (float-array (* 3 4096))]
+                   (dotimes [i 4096] (dotimes [ch 3] (aset c (+ (* ch 4096) i) (float (Math/pow (/ i 4095.0) (+ 0.6 (* 0.3 ch))))))) c)
+          layers [{:img over :mask m :opacity 0.7 :enabled true}
+                  {:curves curves :opacity 1.0 :enabled true}
+                  {:tone {:exposure 0.3 :contrast 0.2 :saturation 0.4} :opacity 0.8 :enabled true}
+                  {:cube {:n 9 :data (swap-cube 9)} :radial [150 100 150 100 0.3 0.9] :opacity 1.0 :enabled true}
+                  {:img over :opacity 0.3 :enabled false}]]
+      (testing "zoomed out, every kind of layer, the mask overlay shown"
+        (let [[g c] (render-both img layers {:scale 0.6 :ox 5 :oy 3 :out-w 190 :out-h 130 :bg [7 8 9 255]
+                                             :overlay m :tint [1.0 0.25 0.2 0.45]})]
+          (is (<= (max-diff* g c) 2) (str "max diff " (max-diff* g c)))))
+      (testing "zoomed in (nearest), turned a quarter and clipped"
+        (let [[g c] (render-both img layers {:xf [0.0 0.25 40.0 -0.25 0.0 170.0] :clip [50 20 200 160]
+                                             :out-w 160 :out-h 120 :bg [7 8 9 255]})]
+          (is (<= (max-diff* g c) 2) (str "max diff " (max-diff* g c)))))
+      (testing "a pixel change shows on the next render (the GPU copy is refreshed)"
+        (let [[g1] (render-both img [] {:scale 1.0 :ox 0 :oy 0 :out-w 4 :out-h 4})]
+          (px/set-pixels! img (float-array (* 3 w h) 1.0))
+          (let [[g2 c2] (render-both img [] {:scale 1.0 :ox 0 :oy 0 :out-w 4 :out-h 4})]
+            (is (not= g1 g2))
+            (is (= g2 c2)))))
+      (px/free-mask! m)
+      (doseq [i [img over]] (px/free-image! i)))))
+
+(deftest gpu-histogram-matches-cpu
+  (when (px/gpu?)
+    (let [w 640 h 480
+          img (filled w h (fn [x y] [(/ x (double w)) (/ y (double h)) (* 0.5 (+ 0.5 (Math/sin (* 0.05 (+ x y)))))]))
+          layers [{:tone {:exposure 0.4 :contrast 0.3 :saturation 0.2} :opacity 0.9 :enabled true}
+                  {:cube {:n 9 :data (swap-cube 9)} :radial [320 240 320 240 0.2 1.0] :opacity 1.0 :enabled true}]
+          both (fn [clip] (px/set-gpu! true)
+                 (let [g (px/histogram img layers clip)]
+                   (px/set-gpu! false)
+                   (let [c (px/histogram img layers clip)] (px/set-gpu! true) [g c])))]
+      (doseq [clip [nil [100 50 300 200]]]
+        (let [[g c] (both clip)]
+          (testing (str "same bins, clip " clip)
+            (doseq [k [:r :g :b :l]]
+              (is (= (reduce + (k c)) (reduce + (k g))) (str k " counts"))
+              ;; to rounding: a value on a bin edge may land in its neighbour, so
+              ;; the cumulative counts agree closely at every bin
+              (let [cum (fn [v] (reductions + v))
+                    worst (reduce max (map #(Math/abs (- %1 %2)) (cum (k g)) (cum (k c))))]
+                (is (<= worst (* 0.005 (reduce + (k c)))) (str k " bins: " worst)))))))
+      (px/free-image! img))))
