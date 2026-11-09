@@ -9,7 +9,9 @@
   (is (cli/batch? ["--noise" "a.NEF"]))
   (is (cli/batch? ["-h"]))
   (is (not (cli/batch? ["a.NEF" "b.jpg"])))
-  (is (not (cli/batch? []))))
+  (is (not (cli/batch? [])))
+  (testing "the process serial number older macOS passes a Finder-launched app isn't an option"
+    (is (not (cli/batch? ["-psn_0_12345"])))))
 
 (deftest parsing
   (testing "filters with key=value settings, files, output options"

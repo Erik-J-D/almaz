@@ -45,10 +45,15 @@ Results are named <input>-almaz.<ext> and keep the input's EXIF.")
 
 (def ext {:jpeg "jpg" :tiff16 "tif" :png16 "png" :png8 "png"})
 
+(defn- finder-arg?
+  "The -psn_… process serial number older macOS passes a Finder-launched app."
+  [a]
+  (str/starts-with? a "-psn_"))
+
 (defn batch?
   "Do these arguments ask for batch processing (any option at all)?"
   [args]
-  (boolean (some #(str/starts-with? % "-") args)))
+  (boolean (some #(and (str/starts-with? % "-") (not (finder-arg? %))) args)))
 
 (defn- parse-number [s]
   (try (Double/parseDouble s) (catch Exception _ nil)))

@@ -142,6 +142,24 @@ The first run on macOS compiles each model for Core ML (cached in
 > channel noise that the SIDD model has never seen, so the app always decodes
 > RAW at full resolution.
 
+## Packaging (macOS)
+
+```sh
+jolt dist      # target/Almaz.app and target/Almaz-<version>-macos-arm64.zip
+```
+
+`native/tools/package_macos.clj` builds the app with `jolt build`, copies
+almaz's native libraries, the BUI kit and everything they load from Homebrew
+(about 100 dylibs) into `Contents/Frameworks`, relinks them to `@rpath`, and
+signs the bundle: ad-hoc by default, or with `ALMAZ_SIGN_IDENTITY="Developer
+ID Application: ..."`. The bundle's executable is a small launcher that puts
+`Contents/Frameworks` on `DYLD_LIBRARY_PATH` before running the app (so a
+notarized build with hardened runtime needs the
+`com.apple.security.cs.allow-dyld-environment-variables` entitlement). Apple
+Silicon only; models are downloaded on first use rather than bundled. The
+launcher also serves the command line:
+`Almaz.app/Contents/MacOS/Almaz --help`.
+
 ## Run and test
 
 ```sh

@@ -47,4 +47,4 @@
   [& args]
   (if (cli/batch? args)
     (System/exit (batch/main args))
-    (open-app! args)))
+    (open-app! (remove #(.startsWith ^String % "-psn_") args))))
