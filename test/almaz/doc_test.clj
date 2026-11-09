@@ -122,3 +122,14 @@
       (is (nil? (d/exif (d/remove-doc db 1) 1))))
     (testing "shot summary"
       (is (= "ISO 5000  1/2000 s  f/8" (d/shot-info (d/exif db 1)))))))
+
+(deftest positions-are-unique-per-document
+  (testing "the schema refuses two layers at one position (the bug a silent no-op shift once caused)"
+    (let [[db a] (d/add-layer db0 1 :denoise)
+          [db b] (d/add-layer db 1 :sharpen)]
+      (is (thrown? Exception (d/update-layer db b assoc :position 0)))
+      (testing "while adding, moving and removing keep positions distinct"
+        (let [[db c] (d/add-layer db 1 :denoise)
+              db (d/move-layer db a 1)]
+          (is (= 3 (count (set (map :position (d/layers db 1))))))
+          (is (= [b] (mapv :id (d/layers (-> db (d/remove-layer a) (d/remove-layer c)) 1)))))))))

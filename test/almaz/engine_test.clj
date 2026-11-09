@@ -70,7 +70,7 @@
 
 (deftest ai-denoise
   (if-not (models/available? :denoise)
-    (println "skipping ai-denoise: run the model export in README first")
+    (println "skipping ai-denoise: the denoise model is not downloaded (the app fetches it on first use)")
     (testing "NAFNet removes most of the noise of a noisy gradient"
       (let [rng (java.util.Random. 3) w 600 h 400
             base (filled w h (fn [x y] (let [v (+ 0.25 (* 0.5 (/ x (double w))))]

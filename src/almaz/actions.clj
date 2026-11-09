@@ -41,7 +41,7 @@
       (s/swap-db! d/add-doc {:path p :raw? (raw/raw-file? p)}))
     (when (and (nil? @s/current*) (seq (d/docs @s/db*)))
       (select-doc! (:id (first (d/docs @s/db*)))))
-    (when (empty? fresh)
+    (when (and (seq paths) (empty? fresh))
       (s/message! "No new supported images"))
     (s/wake!)))
 

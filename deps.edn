@@ -16,13 +16,14 @@
                                  :git/sha "1068e9eef6c6c7bba782cff025314037edd665ff"}
         ;; in-memory relational store: the document/layer data model
         yogthos/relatum {:git/url "https://github.com/yogthos/relatum"
-                         :git/tag "v0.2.1"
-                         :git/sha "59ee5f5bcc44b87faed5df7f23af434876f884f2"}}
+                         :git/tag "v0.3.0"
+                         :git/sha "27530913706318d9228e82c567ddd335f28a77c2"}}
 
  ;; the pixel engine (images, masks, compositing, tiles, PNG/JPEG/TIFF), the
  ;; ONNX Runtime C API (CPU + CoreML/CUDA execution providers), our CoreML
  ;; ObjC++ shim (macOS ANE, precompiled .mlmodelc), and LibRaw. Each entry is a
- ;; list of dlopen candidates tried in order.
+ ;; list of dlopen candidates tried in order. A packaged Almaz.app finds them in
+ ;; its Frameworks folder instead (native/tools/package_macos.clj).
  :jolt/native [{:name "almazimg"
                 :darwin ["native/img/lib/libalmazimg.dylib"]
                 :linux  ["native/img/lib/libalmazimg.so" "libalmazimg.so"]}
@@ -33,20 +34,21 @@
                {:name "almazinfer-onnxruntime"
                 :optional true
                 :darwin ["native/onnxruntime/lib/libalmazinfer_onnxruntime.dylib"]
-                :linux  ["libalmazinfer_onnxruntime.so"]}
+                :linux  ["native/onnxruntime/lib/libalmazinfer_onnxruntime.so" "libalmazinfer_onnxruntime.so"]}
                {:name "almazinfer-coreml"
                 :optional true
                 :darwin ["native/coreml/lib/libalmazinfer_coreml.dylib"]}
                {:name "almazinfer-raw"
                 :optional true
                 :darwin ["native/raw/lib/libalmazinfer_raw.dylib"]
-                :linux  ["libalmazinfer_raw.so"]}]
+                :linux  ["native/raw/lib/libalmazinfer_raw.so" "libalmazinfer_raw.so"]}]
 
  ;; dev/debug entry points under test/ — only the app itself ships from src/.
  :aliases {:run   {:main-opts ["-m" "almaz.core"]}
            :check {:extra-paths ["test"] :main-opts ["-m" "almaz.check"]}
            :test  {:extra-paths ["test"] :main-opts ["-m" "almaz.test-runner"]}}
 
- :tasks {run   "jolt -M:run"
+ :tasks {dist  {:doc "package target/Almaz.app (macOS arm64)" :task (shell "jolt" "native/tools/package_macos.clj")}
+         run   "jolt -M:run"
          check "jolt -M:check"
          test  "jolt -M:test"}}

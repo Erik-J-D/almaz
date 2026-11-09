@@ -7,8 +7,8 @@
 (def pure '[almaz.tile-test almaz.view-test almaz.doc-test almaz.autopilot-test
             almaz.ep-test])
 
-(def native '[almaz.pixels-test almaz.raw-test almaz.ort-test almaz.coreml-test
-              almaz.engine-test])
+(def native '[almaz.download-test almaz.pixels-test almaz.raw-test almaz.ort-test almaz.coreml-test
+              almaz.engine-test almaz.cli-test])
 
 (defmethod t/report :error [m]
   (t/with-test-out

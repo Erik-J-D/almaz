@@ -9,6 +9,8 @@
   (:require [glimmer.core :as ui]
             [glimmer-bui.core]           ; installs the BUI backend
             [almaz.actions :as act]
+            [almaz.batch :as batch]
+            [almaz.cli :as cli]
             [almaz.ui.canvas :as canvas]
             [almaz.ui.chrome :as chrome]
             [almaz.ui.sidebar :as sidebar]
@@ -33,8 +35,16 @@
   (when-let [f (System/getenv "ALMAZ_SCRIPT")]
     (.start (Thread. (fn [] (Thread/sleep 1500) (load-file f))))))
 
-(defn -main [& args]
+(defn- open-app! [files]
   (worker/start!)
   (dev-script!)
-  (act/add-images! (if (seq args) args (filter #(.exists (java.io.File. %)) ["DSC_9852.NEF"])))
+  (act/add-images! (if (seq files) files (filter #(.exists (java.io.File. %)) ["DSC_9852.NEF"])))
   (ui/run app :title "Almaz" :width 1500 :height 960))
+
+(defn -main
+  "With options, batch-process the files (almaz --help); otherwise open them
+   in the app."
+  [& args]
+  (if (cli/batch? args)
+    (System/exit (batch/main args))
+    (open-app! (remove #(.startsWith ^String % "-psn_") args))))

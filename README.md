@@ -42,8 +42,9 @@ denoise ~45 s, sharpen ~45 s for the whole frame, export ~6 s.
 
 Documents and their filter layers live in a [relatum](https://github.com/yogthos/relatum)
 database (`almaz.doc`): `:doc` and `:layer` tables with typed columns, checks
-(status and kind sets, opacity in [0, 1]), and a cascading foreign key from
-layers to their document. Functions take the db and return the new one; the
+(status and kind sets, opacity in [0, 1]), a cascading foreign key from
+layers to their document, and one layer per position in a document's stack
+(`:unique [[:doc-id :position]]`). Functions take the db and return the new one; the
 app keeps it in one reactive cell (`almaz.state/db*`). UI-only state (view,
 tool, selection, job progress) stays in plain cells.
 
@@ -106,8 +107,16 @@ cd ~/src/libraw && make -f Makefile.dist -j8 library   # lib/libraw_r.a
 
 ## Models
 
-Both are official NAFNet checkpoints (megvii-research, Apache-2.0), exported to
-fixed 512x512 ONNX graphs by `native/tools/export_nafnet.py`, which defines the
+Both are official NAFNet checkpoints (megvii-research; MIT, with parts from
+BasicSR under Apache-2.0), exported to fixed 512x512 ONNX graphs. The app
+downloads them on first use from the
+[`models-v1` release](https://github.com/yogthos/almaz/releases/tag/models-v1)
+and verifies each against its pinned SHA-256 (`almaz.models/registry`) before
+using it. They go to `~/Library/Application Support/almaz/models` on macOS,
+`$XDG_DATA_HOME/almaz/models` (or `~/.local/share/almaz/models`) on Linux,
+`models/almaz` in a source checkout, or `$ALMAZ_MODELS` when set.
+
+To re-export them yourself, `native/tools/export_nafnet.py` defines the
 architecture inline and loads checkpoints with torch's safe `weights_only`
 unpickler:
 
@@ -134,6 +143,24 @@ The first run on macOS compiles each model for Core ML (cached in
 > channel noise that the SIDD model has never seen, so the app always decodes
 > RAW at full resolution.
 
+## Packaging (macOS)
+
+```sh
+jolt dist      # target/Almaz.app and target/Almaz-<version>-macos-arm64.zip
+```
+
+`native/tools/package_macos.clj` builds the app with `jolt build`, copies
+almaz's native libraries, the BUI kit and everything they load from Homebrew
+(about 100 dylibs) into `Contents/Frameworks`, relinks them to `@rpath`, and
+signs the bundle: ad-hoc by default, or with `ALMAZ_SIGN_IDENTITY="Developer
+ID Application: ..."`. The bundle's executable is a small launcher that puts
+`Contents/Frameworks` on `DYLD_LIBRARY_PATH` before running the app (so a
+notarized build with hardened runtime needs the
+`com.apple.security.cs.allow-dyld-environment-variables` entitlement). Apple
+Silicon only; models are downloaded on first use rather than bundled. The
+launcher also serves the command line:
+`Almaz.app/Contents/MacOS/Almaz --help`.
+
 ## Run and test
 
 ```sh
@@ -141,6 +168,19 @@ jolt test      # all suites (pure + native; `jolt -M:test pure` for the pure one
 jolt check     # load every namespace
 jolt run       # the app (opens DSC_9852.NEF when present, or files given as args)
 ```
+
+Batch processing (no window) whenever an option is given:
+
+```sh
+jolt run --showSettings DSC_9852.NEF                     # autopilot picks the filters
+jolt run --noise strength=60 -o out *.NEF                # adjust what autopilot chose
+jolt run --override --sharpen model=classic radius=2 x.jpg   # exactly these filters
+jolt run --help                                          # every option
+```
+
+Results are written as `<name>-almaz.<ext>` with the input's EXIF; the exit
+status is 0 when every file went through, 1 when some failed, 2 for a usage
+error.
 
 Interactive development: `jolt nrepl-server`, then from the REPL
 
@@ -159,5 +199,6 @@ the UI in smoke tests).
 
 ## License
 
-GPL-2.0-or-later (glimmer-bui's BUI kit and the shims are GPL). NAFNet weights
-are Apache-2.0.
+GPL-2.0-or-later (glimmer-bui's BUI kit and the shims are GPL). The NAFNet
+weights are MIT licensed (Copyright (c) 2022 megvii-model), with parts from
+BasicSR under Apache-2.0; the release ships their license text.

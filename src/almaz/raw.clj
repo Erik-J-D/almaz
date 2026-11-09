@@ -72,3 +72,17 @@
     (let [p (ffi/alloc a px/meta-layout)]
       (when (pos? (raw-meta* (ffi/string->ptr a path) p))
         (px/read-meta-struct p)))))
+
+(defn source-meta
+  "An input file's shooting metadata: its own EXIF when readable (JPEG, PNG,
+   TIFF-structured RAW), else LibRaw's decoded fields for a RAW file. A RAW
+   decode is already rotated upright, so its orientation becomes 1."
+  [path]
+  (let [r (raw-file? path)
+        m (or (px/read-meta path) (when r (metadata path)))]
+    (cond-> m (and m r) (assoc :orientation 1))))
+
+(defn load-any
+  "Decode a RAW, JPEG, PNG or TIFF file to an image handle."
+  [path]
+  (if (raw-file? path) (decode path) (px/load-image path)))

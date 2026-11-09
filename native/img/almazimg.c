@@ -809,7 +809,7 @@ static int tiff_exif_dir(TIFF *t, const AlmzMeta *m) {
   if (!TIFFWriteCustomDirectory(t, &off)) return 0;
   if (!TIFFSetDirectory(t, 0)) return 0;
   TIFFSetField(t, TIFFTAG_EXIFIFD, off);
-  return 1;
+  return 1; /* TIFFClose writes the changed IFD0 */
 }
 
 int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
