@@ -20,6 +20,8 @@
 ;; the sidebar tab (:enhance :color :dimensions); on :dimensions the image
 ;; pane edits the crop (the whole image shows, the crop as a frame over it)
 (defonce tab* (r/atom :enhance))
+;; doc id -> undo history (almaz.history), the last `undo-limit` edits
+(defonce history* (r/atom {}))
 (defonce job* (r/atom nil))       ; {:label :done :total} while the worker is busy
 (defonce message* (r/atom "Add images to begin"))
 (defonce autopilot* (r/atom true))
@@ -85,6 +87,15 @@
   [id f & args]
   (swap! db* (fn [db] (if (d/doc db id)
                         (d/update-doc (apply f db args) id assoc :edited-at (now))
+                        db)))
+  (wake!))
+
+(defn edit-done!
+  "edit!, for an edit that's complete in itself (a finished brush stroke):
+   nothing more is coming, so processing needn't wait for it to settle."
+  [id f & args]
+  (swap! db* (fn [db] (if (d/doc db id)
+                        (d/update-doc (apply f db args) id assoc :edited-at 0)
                         db)))
   (wake!))
 

@@ -209,6 +209,29 @@
         [:slider {:label "Amount" :min 0 :max 300 :integer 1 :value (pct amount)
                   :on-change #(act/set-param! :sharpen :amount (/ (double %) 100.0))}]])]))
 
+;; ---- repair ----------------------------------------------------------------------
+;; The Repair brush paints the layer's mask; the worker fills what it covers
+;; from around it. Restore paints it away again.
+(defn- repair-settings [layer tool]
+  (let [lid (:id layer)
+        active (when (and lid (= lid (:layer tool))) (:mode tool))]
+    [:vbox {:spacing 4}
+     [:enum {:key :mode :items ["Off" "Repair" "Restore"]
+             :value (case active :paint 1 :erase 2 0)
+             :on-change #(case (long %)
+                           0 (act/set-tool! :pan nil)
+                           1 (act/repair-tool!)
+                           2 (do (act/repair-tool!)
+                                 (act/set-tool! :erase (:id (d/layer-of @s/db* @s/current* :repair)))))}]
+     [:slider {:key :size :label "Brush size" :min 4 :max 1500 :integer 1 :value (long (:radius tool))
+               :on-change #(swap! s/tool* assoc :radius (double %))}]
+     [:slider {:key :hardness :label "Hardness" :min 0 :max 100 :integer 1 :value (pct (:hardness tool))
+               :on-change #(swap! s/tool* assoc :hardness (/ (double %) 100.0))}]
+     [:hbox {:key :clear :align 1}
+      [:button {:text "Clear repairs" :enabled (if lid 1 0) :on-click #(act/mask-fill! lid 0.0)}]]
+     [:label {:key :hint :text "Paint over what to remove (R). Restore paints a repair away."
+              :text-color [1 1 1 0.55]}]]))
+
 ;; ---- colour ----------------------------------------------------------------------
 (defn- tone-slider [layer k label]
   [:slider {:key k :label label :min -100 :max 100 :integer 1 :value (pct (get layer k))
@@ -419,6 +442,7 @@
       (case kind
         :denoise (denoise-settings layer)
         :sharpen (sharpen-settings (assoc ctx :layer layer))
+        :repair (repair-settings layer tool)
         :light (light-settings layer)
         :levels (levels-settings doc layer tool)
         :balance (balance-settings layer)
@@ -428,7 +452,8 @@
         :vignette (vignette-settings layer))
       [:hbox {:key :reset :align 1}
        [:button {:text "Reset" :enabled (if lid 1 0) :on-click #(act/reset-kind! kind)}]]
-      (when (and lid (:mask layer)) (mask-tools layer tool))]]))
+      ;; a repair's mask is the repair itself (its own panel paints it)
+      (when (and lid (:mask layer) (not (d/mask-input? layer))) (mask-tools layer tool))]]))
 
 (defn- panels-ctx []
   (let [db @s/db*

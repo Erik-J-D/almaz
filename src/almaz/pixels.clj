@@ -27,6 +27,13 @@
   [:pointer :double :double :double :double :double :double :double :int32] :void)
 (ffi/defcfn mask-max*       "almz_mask_max"       [:pointer :int32 :int32 :int32 :int32] :float :blocking)
 (ffi/defcfn mask-sample*    "almz_mask_sample"    [:pointer :double :double] :float)
+(ffi/defcfn mask-copy*      "almz_mask_copy"      [:pointer] :pointer :blocking)
+(ffi/defcfn mask-take-dirty* "almz_mask_take_dirty" [:pointer :pointer] :int32)
+(ffi/defcfn mask-add-dirty*  "almz_mask_add_dirty"  [:pointer :int32 :int32 :int32 :int32] :void)
+(ffi/defcfn mask-restore*   "almz_mask_restore"   [:pointer :pointer] :int32 :blocking)
+(ffi/defcfn mask-regions*   "almz_mask_regions"   [:pointer :float :int32 :pointer :int32] :int32 :blocking)
+(ffi/defcfn mask-hole*      "almz_mask_hole"      [:pointer :int32 :int32 :int32 :int32 :float :pointer] :void :blocking)
+(ffi/defcfn inpaint*        "almz_inpaint"        [:pointer :int32 :int32 :pointer :int32 :pointer] :int32 :blocking)
 
 (ffi/defcfn render*         "almz_render"
   [:pointer :pointer :int32 :pointer :pointer :pointer :pointer
@@ -134,6 +141,52 @@
   (double (mask-max* m (int x) (int y) (int w) (int h))))
 
 (defn mask-at [m x y] (double (mask-sample* m (double x) (double y))))
+
+(defn mask-copy "An independent copy of mask `m` (free it with free-mask!)." [m] (mask-copy* m))
+
+(defn mask-take-dirty!
+  "The image rect [x y w h] the mask changed in since the last call, or nil;
+   either way it starts over."
+  [m]
+  (with-open [a (ffi/confined-arena)]
+    (let [p (ffi/alloc a (* 4 4))]
+      (when (pos? (mask-take-dirty* m p))
+        (vec (ffi/read-array p :int32 4))))))
+
+(defn mask-add-dirty!
+  "Mark rect [x y w h] changed again (a job took it and didn't finish)."
+  [m [x y w h]] (mask-add-dirty* m (int x) (int y) (int w) (int h)))
+
+(defn mask-restore!
+  "Put the pixels of `snapshot` (a mask-copy of it) back into `m`."
+  [m snapshot]
+  (when-not (zero? (mask-restore* m snapshot))
+    (throw (ex-info "mask snapshot of another size" {}))))
+
+(def ^:private max-regions 256)
+
+(defn mask-regions
+  "[[x y w h] ...] around the mask's areas over `thr` (image px), grown by
+   `margin`, overlapping ones merged."
+  [m thr margin]
+  (with-open [a (ffi/confined-arena)]
+    (let [p (ffi/alloc a (* 4 4 max-regions))
+          n (mask-regions* m (float thr) (int margin) p (int max-regions))]
+      (mapv vec (partition 4 (vec (ffi/read-array p :int32 (* 4 n))))))))
+
+(defn mask-hole!
+  "Write 1 where the mask is over `thr` at each pixel of rect [x y w h] into
+   the native byte buffer `out` (w * h)."
+  [m [x y w h] thr out]
+  (mask-hole* m (int x) (int y) (int w) (int h) (float thr) out))
+
+(defn mask-hole
+  "mask-hole! into a byte-array."
+  [m [_ _ w h :as rect] thr]
+  (let [p (ffi/alloc (* w h))]
+    (try (mask-hole! m rect thr p)
+         (byte-array (ffi/read-array p (* w h)))
+         (finally (ffi/free p)))))
 
 (defn stroke!
   "A soft round brush segment from [x0 y0] to [x1 y1], image coordinates."
@@ -407,6 +460,28 @@
     (when-not (.renameTo (java.io.File. part) (java.io.File. path))
       (throw (ex-info (str "cannot write " path) {:path path})))
     path))
+
+;; ---- repair ------------------------------------------------------------------
+(defn inpaint!
+  "Fill the hole (native bytes, 1 = hole) of a planar RGB float w x h image
+   at native `src` into `out` (almazimg.h almz_inpaint). Throws when it
+   can't."
+  [src w h hole seed out]
+  (when-not (zero? (inpaint* src (int w) (int h) hole (int seed) out))
+    (throw (ex-info "repair failed (area too small or out of memory)" {:w w :h h}))))
+
+(defn inpaint
+  "inpaint! over Clojure arrays: planar RGB floats and a hole byte-array;
+   returns the filled float-array."
+  [^floats src w h ^bytes hole {:keys [seed] :or {seed 1}}]
+  (let [n (* 3 w h)
+        sp (ffi/alloc (* 4 n)) hp (ffi/alloc (max 1 (* w h))) op (ffi/alloc (* 4 n))]
+    (try
+      (ffi/write-array sp :float src)
+      (ffi/write-array hp hole)
+      (inpaint! sp w h hp seed op)
+      (float-array (ffi/read-array op :float n))
+      (finally (ffi/free sp) (ffi/free hp) (ffi/free op)))))
 
 ;; ---- picking -----------------------------------------------------------------
 (defn sample

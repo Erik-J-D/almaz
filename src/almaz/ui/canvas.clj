@@ -72,8 +72,16 @@
   (when (#{:paint :erase} (:mode tool))
     (some #(when (= (:id %) (:layer tool)) (:mask %)) layers)))
 
-(defn- overlay-mask [layers tool]
-  (when (:show-mask tool) (tool-mask layers tool)))
+(defonce ^:private stroking (atom false)) ; a brush stroke is under way
+
+(defn- overlay-mask
+  "The mask tinted over the image: the brushed layer's while painting it. A
+   repair's only during the stroke (after it, the repaired picture shows)."
+  [layers tool]
+  (when (:show-mask tool)
+    (let [l (some #(when (= (:id %) (:layer tool)) %) layers)]
+      (when (or (not (d/mask-input? l)) @stroking)
+        (tool-mask layers tool)))))
 
 (defn- draw!
   [{:keys [img layers w h preview? geom editing?]} view overlay]
@@ -108,7 +116,7 @@
   [{:keys [doc layers view tool pixels-rev editing?]}]
   (let [d (display doc layers editing?)
         overlay (overlay-mask layers tool)
-        k [(:id doc) (some-> d :img) (:layers d) (:geom d) editing? (dissoc view :zoom) overlay pixels-rev]]
+        k [(:id doc) (some-> d :img) (:layers d) (:geom d) editing? (dissoc view :zoom) overlay @stroking pixels-rev]]
     (when (not= k (:key @frame))
       (if d (draw! d view overlay) (clear! view))
       (swap! frame #(-> % (assoc :key k) (update :version inc))))
@@ -253,6 +261,8 @@
       (and ready? (= :pick (:mode tool))) (act/pick! (->source view doc px* py*))
       (and (not editing?) (v/on-split? view x)) (reset! drag {:kind :split})
       mask (let [p (->source view doc px* py*)]
+             (act/begin-stroke! (:layer tool))
+             (reset! stroking true)
              (stroke! mask tool p p)
              (reset! drag {:kind :paint :mask mask :last p}))
       :else (reset! drag {:kind :pan :x x :y y}))))
@@ -277,10 +287,11 @@
                               (g/display-size doc true) (g/constraint-aspect doc))))))))
 
 (defn on-release [_ _]
+  (reset! stroking false)
   (when (= :paint (:kind @drag))
     (let [tool @s/tool*]
       (when-let [id @s/current*]
-        (s/edit! id d/bump-mask (:layer tool)))))
+        (s/edit-done! id d/bump-mask (:layer tool)))))
   (reset! drag nil))
 
 (def ^:private shift 1)
@@ -299,7 +310,18 @@
       (.offer zoom-wake :zoom))))
 
 (defn- space? [k] (= "space" k))
-(defn on-key [k _] (when (space? k) (reset! s/space* true)))
+(def ^:private ctrl "The kit's Ctrl bit, which macOS's Command sets too." 2)
+
+(defn on-key
+  "Space: pan while held. Cmd/Ctrl+Z undo, with Shift redo; R: the Repair
+   brush. (Keys reach the image pane under the pointer.)"
+  [k mods]
+  (let [k (str k) mods (long (or mods 0))
+        cmd? (pos? (bit-and mods ctrl)) shift? (pos? (bit-and mods shift))]
+    (cond
+      (space? k) (reset! s/space* true)
+      (and cmd? (#{"z" "Z"} k)) (if shift? (act/redo!) (act/undo!))
+      (and (not cmd?) (#{"r" "R"} k)) (act/repair-tool!))))
 (defn on-keyrelease [k _] (when (space? k) (reset! s/space* false)))
 
 (defn on-double [_ _]

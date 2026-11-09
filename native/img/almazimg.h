@@ -37,6 +37,8 @@ typedef struct AlmzMask {
   float *paint;
   float *soft;
   uint64_t uid, rev; /* as AlmzImg's */
+  int32_t dirty;     /* changed since almz_mask_take_dirty: the image rect below */
+  int32_t dx0, dy0, dx1, dy1;
 } AlmzMask;
 
 /* One entry of a layer stack: the filter's output image, its mask (NULL =
@@ -119,6 +121,29 @@ void almz_mask_stroke(AlmzMask *m, double x0, double y0, double x1, double y1,
 float almz_mask_max(const AlmzMask *m, int x, int y, int w, int h);
 /* The feathered value at image coordinates (bilinear). */
 float almz_mask_sample(const AlmzMask *m, double x, double y);
+
+/* The image rect {x, y, w, h} changed since the last call (1), or 0 when
+ * nothing has; either way it starts over. add_dirty marks a rect again (a
+ * job that took it and didn't finish). */
+int almz_mask_take_dirty(AlmzMask *m, int32_t *rect);
+void almz_mask_add_dirty(AlmzMask *m, int x, int y, int w, int h);
+/* An independent copy (for undo), and putting one back into a mask of the
+ * same size (0; -1 when the sizes differ). */
+AlmzMask *almz_mask_copy(const AlmzMask *m);
+int almz_mask_restore(AlmzMask *dst, const AlmzMask *src);
+/* The rects (x, y, w, h, image px) around the mask's connected areas over
+ * `thr`, grown by `margin` and clamped to the image, overlapping ones
+ * merged; at most `max`, returns how many. */
+int almz_mask_regions(const AlmzMask *m, float thr, int margin, int32_t *rects, int max);
+/* 1 where the mask is over `thr` at the pixels of the rect (x0, y0, w, h). */
+void almz_mask_hole(const AlmzMask *m, int x0, int y0, int w, int h, float thr, uint8_t *out);
+
+/* -- repair ---------------------------------------------------------------- */
+/* Fill the pixels where hole != 0 of a planar RGB (0..1) w x h image from
+ * the rest of it (inpaint.c: PatchMatch texture, healed lighting) into
+ * `out`; other pixels are copied. Deterministic for `seed`. 0 on success,
+ * -1 when it can't (too small, out of memory: `out` is then the input). */
+int almz_inpaint(const float *src, int w, int h, const uint8_t *hole, unsigned seed, float *out);
 
 /* -- rendering ----------------------------------------------------------- */
 /* Render the layer stack into the RGBA8 rectangle (rx, ry, rw, rh) of `out`

@@ -78,17 +78,45 @@
   (let [[dw dh] (or (s/display-size dc) [(:w dc) (:h dc)])]
     (g/apply-xf (g/display->source dc (s/editing-crop?)) (v/focus @s/view* dw dh))))
 
+;; A repair layer's last finished run: {lid {:input :img}}, its input
+;; signature and output image then. While both still hold, a new run only
+;; redoes where the mask changed since (almaz.engine/repair! :dirty).
+(defonce ^:private repaired (atom {}))
+
+(defn- repair-layer!
+  "Run a repair, incrementally when only its mask changed since it last
+   finished."
+  [{:keys [dc layer below out input label cancelled?]}]
+  (let [lid (:id layer)
+        mask (:mask layer)
+        dirty (px/mask-take-dirty! mask)
+        incremental? (= {:input input :img out} (get @repaired lid))]
+    (when-not incremental? (swap! repaired dissoc lid))
+    (let [result (if (and incremental? (nil? dirty))
+                   :done
+                   (eng/repair! {:base (:base dc) :below below :out out :mask mask
+                                 :dirty (when incremental? dirty)
+                                 :progress (report-progress label) :cancelled? cancelled?}))]
+      (if (= :done result)
+        (swap! repaired assoc lid {:input input :img out})
+        ;; the next run redoes what this one took on
+        (when (and incremental? dirty) (px/mask-add-dirty! mask dirty)))
+      result)))
+
 (defn- run-layer!
   "Run the job's tiles; record the result unless it was cancelled."
-  [{:keys [dc layer sig below out label]}]
+  [{:keys [dc layer sig below out label] :as job}]
   (let [{:keys [id base w h]} dc
         lid (:id layer)
         t0 (s/now)
-        result (eng/process! {:base base :below below :out out :mask (:mask layer)
-                              :op (eng/op-for layer (session-for layer label))
-                              :focus (focus dc)
-                              :progress (report-progress label)
-                              :cancelled? #(not= sig (live-sig id lid))})]
+        cancelled? #(not= sig (live-sig id lid))
+        result (if (= :repair (:kind layer))
+                 (repair-layer! (assoc job :cancelled? cancelled?))
+                 (eng/process! {:base base :below below :out out :mask (:mask layer)
+                                :op (eng/op-for layer (session-for layer label))
+                                :focus (focus dc)
+                                :progress (report-progress label)
+                                :cancelled? cancelled?}))]
     (when (#{:done :partial} result)
       (finished! dc {:lid lid :sig sig :result result :mask-rev (:mask-rev layer)})
       (s/message! (format "%s done in %.1fs" label (/ (- (s/now) t0) 1000.0))))))
@@ -105,6 +133,7 @@
     (try
       (run-layer! {:dc dc :layer layer :below below :out out
                    :sig (nth (d/signatures @s/db* id) idx)
+                   :input (nth (d/input-signatures @s/db* id) idx)
                    :label (get-in d/kinds [(:kind layer) :label])})
       (finally (life/released!)))))
 

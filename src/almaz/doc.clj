@@ -66,21 +66,26 @@
 
 (def kinds
   "Layer kinds, in pipeline order (denoise before sharpen: sharpening noise
-   amplifies it; the colour adjustments after both, over the restored image,
+   amplifies it; repairs over the restored image; the colour adjustments
+   after them,
    in darktable's order: tone, levels, colour balance, hue and saturation,
    selective colour, black & white, then the vignette over the result).
    :tab is where its panel lives, :params its settings' defaults. A :live
    kind is computed as it is drawn (no processing, no pixels of its own)."
   {:denoise   {:label "Denoise" :order 0 :tab :enhance :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
    :sharpen   {:label "Sharpen" :order 1 :tab :enhance :params {:model :ai :detail 0.0 :amount 1.0 :radius 1.5}}
-   :light     {:label "Light" :order 2 :tab :color :live true
+   ;; the Repair brush: its mask is what to repair (empty to start), filled
+   ;; from the surroundings (almaz.engine/repair!)
+   :repair    {:label "Repair" :order 2 :tab :enhance :mask-input true :mask-fill 0.0 :feather 3.0
+               :params {:model :classic}}
+   :light     {:label "Light" :order 3 :tab :color :live true
                :params (assoc (zipmap tone-keys (repeat 0.0)) :model :classic)}
-   :levels    {:label "Levels" :order 3 :tab :color :live true :params (colour-params :levels)}
-   :balance   {:label "Color Balance" :order 4 :tab :color :live true :params (colour-params :balance)}
-   :hsl       {:label "Hue & Saturation" :order 5 :tab :color :live true :params (colour-params :hsl)}
-   :selective {:label "Selective Color" :order 6 :tab :color :live true :params (colour-params :selective)}
-   :bw        {:label "Black & White" :order 7 :tab :color :live true :params (colour-params :bw)}
-   :vignette  {:label "Vignette" :order 8 :tab :color :live true :params (colour-params :vignette)}})
+   :levels    {:label "Levels" :order 4 :tab :color :live true :params (colour-params :levels)}
+   :balance   {:label "Color Balance" :order 5 :tab :color :live true :params (colour-params :balance)}
+   :hsl       {:label "Hue & Saturation" :order 6 :tab :color :live true :params (colour-params :hsl)}
+   :selective {:label "Selective Color" :order 7 :tab :color :live true :params (colour-params :selective)}
+   :bw        {:label "Black & White" :order 8 :tab :color :live true :params (colour-params :bw)}
+   :vignette  {:label "Vignette" :order 9 :tab :color :live true :params (colour-params :vignette)}})
 
 (defn kinds-in
   "The kinds whose panels live in `tab`, in pipeline order."
@@ -147,6 +152,14 @@
 
 (defn live? "Is the layer computed as it's drawn?" [layer] (boolean (get-in kinds [(:kind layer) :live])))
 
+(defn mask-input?
+  "Is the layer's mask what it works on (its output depends on the mask),
+   rather than only where its result shows?"
+  [layer] (boolean (get-in kinds [(:kind layer) :mask-input])))
+
+(defn mask-fill "A new mask's value for the layer: 1 everywhere, 0 for repairs." [layer]
+  (get-in kinds [(:kind layer) :mask-fill] 1.0))
+
 (defn tone
   "A light layer's adjustments, or nil for other kinds."
   [layer]
@@ -208,7 +221,8 @@
     [db (:id l)]
     (let [id (rc/next-id db :layer)]
       [(rc/insert db :layer (merge (get-in kinds [kind :params])
-                                   {:doc-id doc-id :kind kind :position (get-in kinds [kind :order])}))
+                                   {:doc-id doc-id :kind kind :position (get-in kinds [kind :order])}
+                                   (when-let [f (get-in kinds [kind :feather])] {:feather f})))
        id])))
 
 (defn update-layer [db id f & args]
@@ -264,19 +278,30 @@
 
 ;; ---- staleness ---------------------------------------------------------------
 (defn- stack-signatures
-  "[each layer's signature, the signature of the composite on top]."
+  "[each layer's signature, the signature of the composite on top, each
+   layer's input signature (its signature but for its own mask)]."
   [db doc-id]
-  (loop [ls (layers db doc-id) below [doc-id] acc []]
+  (loop [ls (layers db doc-id) below [doc-id] acc [] inputs []]
     (if-let [l (first ls)]
-      (let [sig [(:kind l) (params l) below]]
+      (let [input [(:kind l) (params l) below]
+            sig (cond-> input
+                  (mask-input? l) (conj [:mask (:id l) (:mask-rev l)]))]
         (recur (rest ls)
                ;; the layer's id stands for its mask: two layers' masks can
                ;; differ at equal revisions, so equal settings aren't equal input
                (if (:enabled l)
                  (conj below [(:id l) sig (:opacity l) (:mask-rev l) (:feather l)])
                  below)
-               (conj acc (pr-str sig))))
-      [acc below])))
+               (conj acc (pr-str sig))
+               (conj inputs (pr-str input))))
+      [acc below inputs])))
+
+(defn input-signatures
+  "Each layer's signature but for its own mask: what it reads and how. A
+   repair whose input signature is unchanged since it last finished only
+   needs redoing where its mask changed."
+  [db doc-id]
+  (nth (stack-signatures db doc-id) 2))
 
 (defn signatures
   "Each layer's signature (as stored in :done-sig): its kind and params and

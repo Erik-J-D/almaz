@@ -33,6 +33,16 @@ See [PLAN.md](PLAN.md) for the target analysis and plan.
   on the image, free, to an aspect ratio (original, presets, custom) or to a
   size (custom, presets). Nothing is resampled until export. A histogram of
   the result sits above the navigator.
+- **Repair** (Enhance tab, or press R over the image): brush over a blemish
+  or an object and it is filled from its surroundings: PatchMatch
+  (multi-scale, with texture features so fine texture isn't filled with
+  flat colour), light from darktable's healing solve across the edge, detail
+  from the matched patches. It's a layer like the others: its mask is what's
+  repaired, Restore paints a repair away, and repairs re-run when a layer
+  below them changes.
+- **Undo / Redo** (Cmd+Z / Shift+Cmd+Z over the image, or the top bar): the
+  last 10 edits per image, settings, switches, crop and turns, mask and
+  repair strokes; a slider drag is one step.
 - **Autopilot** measures noise and sharpness when an image opens and switches
   on the filters it needs at suggested strengths.
 - On macOS the picture on screen (the layer stack, colour adjustments,
@@ -92,6 +102,7 @@ src/almaz/
   view.clj              viewport math (pure)
   geom.clj              orientation, crop, display <-> source mapping (pure)
   color.clj             colour adjustments and their tables (pure)
+  history.clj           undo / redo snapshots and stack (pure)
   tables.clj            colour tables built off the UI thread
   autopilot.clj         estimates -> layers (pure)
   engine.clj            runs one layer over the composite, tile by tile
@@ -104,6 +115,7 @@ native/
   img/                  pixel engine (C): 16-bit images + mip pyramid, masks,
                         compositing, tiles, filters, estimators, file I/O;
                         almazimg_metal.m draws the composite with Metal
+                        inpaint.c fills repairs (PatchMatch + healing)
   onnxruntime/          C++ shim over ONNX Runtime (CPU, CoreML, CUDA EPs)
   raw/                  C++ shim over LibRaw
   coreml/               ObjC++ shim over Core ML (.mlmodelc)

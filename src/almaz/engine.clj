@@ -100,3 +100,63 @@
       (finally
         (ffi/free in)
         (ffi/free res)))))
+
+;; ---- repair --------------------------------------------------------------------
+(def repair-threshold
+  "Mask values over this are repaired: the whole painted area, its feather
+   included, so the blend at its edge only meets repaired pixels."
+  0.02)
+
+(defn- context
+  "The crop to repair area `r` [x y w h] in: grown by as much again as the
+   area (at least 48 px) for texture to draw from, inside the image."
+  [[x y w h] iw ih]
+  (let [m (max 48 (max w h))
+        x0 (max 0 (- x m)) y0 (max 0 (- y m))
+        x1 (min iw (+ x w m)) y1 (min ih (+ y h m))]
+    [x0 y0 (- x1 x0) (- y1 y0)]))
+
+(defn- overlaps? [[ax ay aw ah] [bx by bw bh]]
+  (and (< ax (+ bx bw)) (< bx (+ ax aw)) (< ay (+ by bh)) (< by (+ ay ah))))
+
+(defn repair!
+  "Fill what layer mask `mask` paints, in `out`, from its surroundings in
+   the composite of `base` + `below` (almaz.pixels/inpaint!). Each painted
+   area is filled within a crop around it, read from `out` so neighbouring
+   areas see each other's repairs.
+
+   Without :dirty, `out` starts over as that composite and every area is
+   filled. With :dirty [x y w h] (the mask's change since `out` was last
+   finished over the same composite below), only that rect goes back to the
+   composite and only the areas touching it are filled again. opts:
+   :progress (fn [done total]), :cancelled? (fn []) between areas. Returns
+   :done or :cancelled."
+  [{:keys [base below out mask dirty progress cancelled?]
+    :or {progress (fn [_ _]) cancelled? (constantly false)}}]
+  (let [w (px/width base) h (px/height base)
+        areas (px/mask-regions mask repair-threshold 0)
+        todo (if dirty
+               (do (let [[x y dw dh] dirty
+                         n (* 3 dw dh) buf (ffi/alloc (* 4 n))]
+                     (try (px/tile-extract! base below {:x x :y y :w dw :h dh} buf)
+                          (px/tile-write! out buf {:x x :y y :w dw :h dh} {})
+                          (finally (ffi/free buf))))
+                   (filterv #(overlaps? % dirty) areas))
+               (do (px/composite-into! out base below) areas))
+        crops (mapv #(context % w h) todo)]
+    (loop [[r & more] crops [a & as] todo i 0]
+      (cond
+        (nil? r) :done
+        (cancelled?) :cancelled
+        :else
+        (let [[x y cw ch] r
+              n (* 3 cw ch)
+              src (ffi/alloc (* 4 n)) res (ffi/alloc (* 4 n)) hole (ffi/alloc (* cw ch))]
+          (try
+            (px/tile-extract! out [] {:x x :y y :w cw :h ch} src)
+            (px/mask-hole! mask r repair-threshold hole)
+            (px/inpaint! src cw ch hole (+ 1 (first a) (* 7919 (second a))) res)
+            (px/tile-write! out res {:x x :y y :w cw :h ch} {})
+            (finally (ffi/free src) (ffi/free res) (ffi/free hole)))
+          (progress (inc i) (count crops))
+          (recur more as (inc i)))))))

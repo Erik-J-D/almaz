@@ -410,3 +410,125 @@
                     worst (reduce max (map #(Math/abs (- %1 %2)) (cum (k g)) (cum (k c))))]
                 (is (<= worst (* 0.005 (reduce + (k c)))) (str k " bins: " worst)))))))
       (px/free-image! img))))
+
+;; ---- repair (inpainting) ------------------------------------------------------
+(defn- planar
+  "Planar RGB floats of f(x, y) over w x h."
+  [w h f]
+  (let [a (float-array (* 3 w h)) n (* w h)]
+    (dotimes [y h] (dotimes [x w]
+      (let [[r g b] (f x y) i (+ x (* y w))]
+        (aset a i (float r)) (aset a (+ n i) (float g)) (aset a (+ (* 2 n) i) (float b)))))
+    a))
+
+(defn- hole-in [w h pred]
+  (let [a (byte-array (* w h))]
+    (dotimes [y h] (dotimes [x w] (when (pred x y) (aset a (+ x (* y w)) (byte 1)))))
+    a))
+
+(defn- at [^floats a w h x y] (let [n (* w h) i (+ x (* y w))] [(aget a i) (aget a (+ n i)) (aget a (+ (* 2 n) i))]))
+
+(deftest inpaint
+  (let [w 96 h 80
+        disc (fn [x y] (< (+ (Math/pow (- x 48) 2) (Math/pow (- y 40) 2)) 144))]
+    (testing "a smooth gradient: the hole continues it, the rest is untouched"
+      (let [src (planar w h (fn [x y] [(/ x 95.0) (/ y 79.0) 0.5]))
+            ;; something bright in the hole that must go
+            src (let [a (aclone src)] (dotimes [y h] (dotimes [x w] (when (disc x y) (dotimes [c 3] (aset a (+ (* c w h) x (* y w)) (float 1.0)))))) a)
+            out (px/inpaint src w h (hole-in w h disc) {:seed 1})]
+        (is (every? true? (map (partial close? 1e-6) (at src w h 5 5) (at out w h 5 5))) "outside the hole")
+        (doseq [[x y] [[48 40] [40 35] [55 46]]]
+          (is (every? true? (map (partial close? 0.06) [(/ x 95.0) (/ y 79.0) 0.5] (at out w h x y)))
+              (str "inside at " [x y] ": " (at out w h x y))))))
+    (testing "a texture: vertical stripes carry on through the hole"
+      (let [stripe (fn [x _] (if (< (mod x 8) 4) [0.9 0.9 0.9] [0.1 0.1 0.1]))
+            src (planar w h stripe)
+            out (px/inpaint src w h (hole-in w h disc) {:seed 1})
+            ok (count (for [y (range 32 48) x (range 40 56)
+                            :when (< (Math/abs (- (first (at out w h x y)) (first (stripe x y)))) 0.3)] 1))]
+        (is (> ok (* 0.8 16 16)) (str ok " of 256 pixels follow the stripes"))))
+    (testing "two runs of the same repair agree (threads may vary the detail, not the result)"
+      (let [src (planar w h (fn [x y] [(+ 0.5 (* 0.4 (Math/sin (* 0.3 x)))) (+ 0.5 (* 0.4 (Math/cos (* 0.2 y)))) 0.4]))
+            hole (hole-in w h disc)
+            a (px/inpaint src w h hole {:seed 3}) b (px/inpaint src w h hole {:seed 3})
+            n (alength a)
+            diff (/ (reduce + (map #(Math/abs (- (aget a %) (aget b %))) (range n))) n)]
+        (is (< diff 0.01) (str "mean difference " diff))))
+    (testing "a large hole in random texture under a lighting gradient stays in range (the healing once drifted)"
+      (let [w 220 h 220 rng (java.util.Random. 5)
+            src (planar w h (fn [x y] (let [light (+ 0.2 (* 0.5 (/ x 219.0))) t (* 0.15 (.nextDouble rng))]
+                                       [(+ light t) (+ (* 0.8 light) t) (+ (* 0.6 light) (* 0.5 t))])))
+            big (fn [x y] (< (+ (Math/pow (- x 110) 2) (Math/pow (- y 110) 2)) 3600))
+            out (px/inpaint src w h (hole-in w h big) {:seed 2})
+            inside (for [y (range h) x (range w) :when (big x y)] [x y])
+            red (map (fn [[x y]] (first (at out w h x y))) inside)]
+        (is (<= 0.15 (apply min red)) (str "min " (apply min red)))
+        (is (<= (apply max red) 0.9) (str "max " (apply max red)))
+        (testing "and its light follows the gradient across it"
+          (let [mean (fn [xs] (/ (reduce + xs) (count xs)))
+                col (fn [cx] (mean (for [y (range 95 125)] (first (at out w h cx y)))))]
+            (is (< (Math/abs (- (col 70) (+ 0.2 (* 0.5 (/ 70 219.0)) 0.075))) 0.08) (str "left " (col 70)))
+            (is (< (Math/abs (- (col 150) (+ 0.2 (* 0.5 (/ 150 219.0)) 0.075))) 0.08) (str "right " (col 150)))))))
+    (testing "the fill keeps the texture's grain (not a smooth blur)"
+      (let [w 160 h 160 rng (java.util.Random. 9)
+            src (planar w h (fn [_ _] (let [v (+ 0.3 (* 0.4 (.nextDouble rng)))] [v v v])))
+            hole? (fn [x y] (< (+ (Math/pow (- x 80) 2) (Math/pow (- y 80) 2)) 900))
+            out (px/inpaint src w h (hole-in w h hole?) {:seed 4})
+            grain (fn [pts] (let [ds (for [[x y] pts] (Math/abs (- (first (at out w h x y)) (first (at out w h (inc x) y)))))]
+                              (/ (reduce + ds) (count ds))))
+            inside (for [y (range 60 100) x (range 60 100) :when (and (hole? x y) (hole? (inc x) y))] [x y])
+            outside (for [y (range 5 40) x (range 5 40)] [x y])]
+        (is (> (grain inside) (* 0.6 (grain outside)))
+            (str "grain inside " (grain inside) " outside " (grain outside)))))
+    (testing "beside a large smooth area, a hole in texture is filled with texture (not the smooth patches)"
+      (let [w 240 h 200 rng (java.util.Random. 11)
+            src (planar w h (fn [x _] (if (< x 120)
+                                        [0.45 0.45 0.45]
+                                        (let [v (+ 0.3 (* 0.3 (.nextDouble rng)))] [v v v]))))
+            hole? (fn [x y] (< (+ (Math/pow (- x 165) 2) (Math/pow (- y 100) 2)) 900))
+            out (px/inpaint src w h (hole-in w h hole?) {:seed 6})
+            grain (fn [pts] (let [ds (for [[x y] pts] (Math/abs (- (first (at out w h x y)) (first (at out w h (inc x) y)))))]
+                              (/ (reduce + ds) (count ds))))
+            inside (for [y (range 80 120) x (range 145 185) :when (and (hole? x y) (hole? (inc x) y))] [x y])
+            textured (for [y (range 5 40) x (range 200 235)] [x y])]
+        (is (> (grain inside) (* 0.6 (grain textured)))
+            (str "grain inside " (grain inside) " textured " (grain textured)))))
+    (testing "no hole: unchanged"
+      (let [src (planar w h (fn [x y] [0.3 0.4 0.5]))]
+        (is (= (vec src) (vec (px/inpaint src w h (byte-array (* w h)) {:seed 1}))))))))
+
+(deftest mask-regions
+  (let [m (px/new-mask 400 300 4 0.0)]
+    (testing "an empty mask has none"
+      (is (= [] (px/mask-regions m 0.5 0))))
+    (px/stroke! m [50 50] [60 50] {:radius 10 :hardness 1.0})
+    (px/stroke! m [300 200] [300 210] {:radius 8 :hardness 1.0})
+    (testing "each painted blob is a rect around it (source px), apart from the others"
+      (let [rs (sort (px/mask-regions m 0.5 0))]
+        (is (= 2 (count rs)))
+        (let [[[x y w h] [x2 y2]] rs]
+          (is (<= 36 x 44) (str rs))
+          (is (<= 36 y 44))
+          (is (<= 20 w 40))
+          (is (<= 280 x2 296))
+          (is (<= 185 y2 196)))))
+    (testing "a margin grows them, clamped to the image; overlapping ones merge"
+      (let [rs (px/mask-regions m 0.5 200)]
+        (is (= 1 (count rs)))
+        (is (= [0 0 400 300] (first rs)))))
+    (testing "the hole of a rect: mask over the threshold at each pixel"
+      (let [hole (px/mask-hole m [40 40 30 20] 0.5)]
+        (is (= (* 30 20) (alength hole)))
+        (is (= 1 (aget hole (+ 15 (* 10 30)))))
+        (is (= 0 (aget hole 0)))))
+    (px/free-mask! m)))
+
+(deftest mask-snapshots
+  (let [m (px/new-mask 64 64 4 0.0)
+        snap (px/mask-copy m)]
+    (px/stroke! m [32 32] [32 32] {:radius 10 :hardness 1.0})
+    (is (> (px/mask-at m 32 32) 0.5))
+    (testing "restoring a copy puts the old pixels back"
+      (px/mask-restore! m snap)
+      (is (< (px/mask-at m 32 32) 0.01)))
+    (doseq [x [m snap]] (px/free-mask! x))))

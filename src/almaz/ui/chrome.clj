@@ -26,6 +26,12 @@
              :value (case mode :split 1 :side 2 0)
              :on-change #(act/set-mode! ([:single :split :side] (long %)))}]
      [:label {:text "" :weight 1}]
+     (let [_ @s/history* _ @s/current*]
+       [:hbox {:weight 0 :spacing 2}
+        [:button {:text "Undo" :icon "LOOP_BACK" :enabled (if (act/can-undo?) 1 0) :on-click act/undo!
+                  :description "Undo (Cmd+Z)"}]
+        [:button {:text "Redo" :icon "LOOP_FORWARDS" :enabled (if (act/can-redo?) 1 0) :on-click act/redo!
+                  :description "Redo (Shift+Cmd+Z)"}]])
      [:label {:text (str "v" version) :weight 0}]
      [:dropdown {:items (mapv first act/export-formats) :weight 0 :value @export-format
                  :on-change #(reset! export-format (long %))}]

@@ -59,7 +59,7 @@
       (is (thrown? Exception (d/update-layer db id assoc :opacity 1.5))))))
 
 (deftest tabs
-  (is (= [:denoise :sharpen] (d/kinds-in :enhance)))
+  (is (= [:denoise :sharpen :repair] (d/kinds-in :enhance)))
   (is (= [:light :levels :balance :hsl :selective :bw :vignette] (d/kinds-in :color))))
 
 (deftest colour-layers
@@ -149,7 +149,7 @@
       (is (= [:denoise :sharpen :light] (kinds db)))
       (is (= {:exposure 0.0 :contrast 0.0 :highlights 0.0 :shadows 0.0 :whites 0.0 :blacks 0.0 :saturation 0.0}
              (d/tone (d/layer db l))))
-      (is (= 2 (:position (d/layer db l))) "the filters stay below it"))
+      (is (= 3 (:position (d/layer db l))) "the filters stay below it"))
     (testing "an adjustment is computed as it's drawn: never queued for processing"
       (let [db (processed db)]
         (is (d/processed? db 1))
@@ -185,3 +185,22 @@
   (testing "a doc starts upright, uncropped, unconstrained"
     (is (= {:orient 0 :crop-w nil :constrain :free}
            (select-keys (d/doc db0 1) [:orient :crop-w :constrain])))))
+
+(deftest repair-layers
+  (let [[db n] (d/ensure-layer db0 1 :denoise)
+        [db r] (d/ensure-layer db 1 :repair)
+        [db l] (d/ensure-layer db 1 :light)
+        db (processed db)]
+    (testing "repairs go after the filters and before the colour adjustments"
+      (is (= [:denoise :repair :light] (kinds db))))
+    (testing "its mask starts empty: nothing is repaired until painted"
+      (is (= 0.0 (d/mask-fill (d/layer db r))))
+      (is (= 1.0 (d/mask-fill (d/layer db n)))))
+    (testing "painting re-runs the repair itself, not just the layers above"
+      (is (= [1] (d/stale-indices (d/bump-mask db r) 1)))
+      (is (= [] (d/stale-indices (d/bump-mask db l) 1)) "other layers' masks only change their blend")
+      (is (= [1] (d/stale-indices (d/bump-mask db n) 1)) "a mask below changes what it repairs"))
+    (testing "its input signature ignores its own mask, not what's below"
+      (let [in #(nth (d/input-signatures % 1) 1)]
+        (is (= (in db) (in (d/bump-mask db r))))
+        (is (not= (in db) (in (d/bump-mask db n))))))))

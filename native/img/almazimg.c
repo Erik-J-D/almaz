@@ -221,8 +221,39 @@ void almz_mask_free(AlmzMask *m) {
 
 /* Recompute `soft` over the mask rectangle [x0,x1) x [y0,y1): a separable
  * gaussian of `paint` (edges clamped). */
+/* ---- what changed (for incremental repairs) ---- */
+static pthread_mutex_t dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* mark the image rect [x0, x1) x [y0, y1) changed */
+static void mark_dirty(AlmzMask *m, int x0, int y0, int x1, int y1) {
+  x0 = MAX(0, x0), y0 = MAX(0, y0), x1 = MIN(m->iw, x1), y1 = MIN(m->ih, y1);
+  if (x1 <= x0 || y1 <= y0) return;
+  pthread_mutex_lock(&dirty_lock);
+  if (m->dirty) {
+    m->dx0 = MIN(m->dx0, x0), m->dy0 = MIN(m->dy0, y0), m->dx1 = MAX(m->dx1, x1), m->dy1 = MAX(m->dy1, y1);
+  } else {
+    m->dirty = 1, m->dx0 = x0, m->dy0 = y0, m->dx1 = x1, m->dy1 = y1;
+  }
+  pthread_mutex_unlock(&dirty_lock);
+}
+
+static void mark_all(AlmzMask *m) { mark_dirty(m, 0, 0, m->iw, m->ih); }
+
+int almz_mask_take_dirty(AlmzMask *m, int32_t *r) {
+  pthread_mutex_lock(&dirty_lock);
+  const int d = m->dirty;
+  if (d) r[0] = m->dx0, r[1] = m->dy0, r[2] = m->dx1 - m->dx0, r[3] = m->dy1 - m->dy0;
+  m->dirty = 0;
+  pthread_mutex_unlock(&dirty_lock);
+  return d;
+}
+
+void almz_mask_add_dirty(AlmzMask *m, int x, int y, int w, int h) { mark_dirty(m, x, y, x + w, y + h); }
+
 static void soft_update(AlmzMask *m, int x0, int y0, int x1, int y1) {
   bump(&m->rev);
+  /* the cells redone, as image px (a cell spans div of them) */
+  mark_dirty(m, MAX(0, x0) * m->div, MAX(0, y0) * m->div, (x1 + 1) * m->div, (y1 + 1) * m->div);
   x0 = MAX(0, x0);
   y0 = MAX(0, y0);
   x1 = MIN(m->w, x1);
@@ -266,10 +297,50 @@ static void soft_update(AlmzMask *m, int x0, int y0, int x1, int y1) {
   free(k);
 }
 
+AlmzMask *almz_mask_copy(const AlmzMask *m) {
+  AlmzMask *c = (AlmzMask *)calloc(1, sizeof(AlmzMask));
+  const size_t n = (size_t)m->w * m->h;
+  if (!c) return NULL;
+  *c = *m;
+  c->paint = (float *)malloc(n * sizeof(float));
+  c->soft = (float *)malloc(n * sizeof(float));
+  if (!c->paint || !c->soft) {
+    free(c->paint);
+    free(c->soft);
+    free(c);
+    return NULL;
+  }
+  memcpy(c->paint, m->paint, n * sizeof(float));
+  memcpy(c->soft, m->soft, n * sizeof(float));
+  c->uid = next_uid();
+  c->rev = 0;
+  c->dirty = 0;
+  return c;
+}
+
+int almz_mask_restore(AlmzMask *dst, const AlmzMask *src) {
+  if (dst->w != src->w || dst->h != src->h) return -1;
+  const size_t n = (size_t)dst->w * dst->h;
+  /* mark only where it differs (an undone stroke is usually small) */
+  int x0 = dst->w, y0 = dst->h, x1 = -1, y1 = -1;
+  for (int y = 0; y < dst->h; y++)
+    for (int x = 0; x < dst->w; x++) {
+      const size_t i = (size_t)y * dst->w + x;
+      if (dst->soft[i] != src->soft[i]) x0 = MIN(x0, x), y0 = MIN(y0, y), x1 = MAX(x1, x), y1 = MAX(y1, y);
+    }
+  memcpy(dst->paint, src->paint, n * sizeof(float));
+  memcpy(dst->soft, src->soft, n * sizeof(float));
+  dst->feather = src->feather;
+  bump(&dst->rev);
+  if (x1 >= 0) mark_dirty(dst, x0 * dst->div, y0 * dst->div, (x1 + 1) * dst->div, (y1 + 1) * dst->div);
+  return 0;
+}
+
 void almz_mask_fill(AlmzMask *m, float v) {
   size_t n = (size_t)m->w * m->h;
   for (size_t i = 0; i < n; i++) m->paint[i] = m->soft[i] = v;
   bump(&m->rev);
+  mark_all(m);
 }
 
 void almz_mask_invert(AlmzMask *m) {
