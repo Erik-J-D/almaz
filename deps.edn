@@ -1,0 +1,52 @@
+{;; jolt.ffi/write takes the value BEFORE the offset as of jolt 0.8.0; declare the
+ ;; floor so an older runtime refuses instead of writing to the wrong place.
+ :jolt/min-version "0.8.0"
+
+ :paths ["src"]
+
+ ;; glimmer = reactive core (no deps); glimmer-bui = BUI (Blender-look) backend,
+ ;; GPL-2.0+; glimmer-gl/glimmer-gtk = image pane (textured quad + blit), same
+ ;; pins splat-painter uses.
+ :deps {jolt-lang/glimmer  {:git/url "https://github.com/jolt-lang/glimmer"
+                            :git/tag "v0.1.4"
+                            :git/sha "09b8ab08705fa1e6f20145c2e99eaaba9ea812cc"}
+        ;; BUI (Blender-look) backend; GPL-2.0+
+        jlt-commons/glimmer-bui {:git/url "https://github.com/jlt-commons/glimmer-bui"
+                                 :git/tag "v0.1.0"
+                                 :git/sha "1068e9eef6c6c7bba782cff025314037edd665ff"}
+        ;; in-memory relational store: the document/layer data model
+        yogthos/relatum {:git/url "https://github.com/yogthos/relatum"
+                         :git/tag "v0.2.1"
+                         :git/sha "59ee5f5bcc44b87faed5df7f23af434876f884f2"}}
+
+ ;; the pixel engine (images, masks, compositing, tiles, PNG/JPEG/TIFF), the
+ ;; ONNX Runtime C API (CPU + CoreML/CUDA execution providers), our CoreML
+ ;; ObjC++ shim (macOS ANE, precompiled .mlmodelc), and LibRaw. Each entry is a
+ ;; list of dlopen candidates tried in order.
+ :jolt/native [{:name "almazimg"
+                :darwin ["native/img/lib/libalmazimg.dylib"]
+                :linux  ["native/img/lib/libalmazimg.so" "libalmazimg.so"]}
+               ;; :optional — load if present, don't error if absent. The app
+               ;; falls back to CPU when these aren't installed (see almaz.infer.ep).
+               ;; Each is our thin C shim (native/<backend>/lib/…) that links the
+               ;; real engine (libonnxruntime / the CoreML framework) transitively.
+               {:name "almazinfer-onnxruntime"
+                :optional true
+                :darwin ["native/onnxruntime/lib/libalmazinfer_onnxruntime.dylib"]
+                :linux  ["libalmazinfer_onnxruntime.so"]}
+               {:name "almazinfer-coreml"
+                :optional true
+                :darwin ["native/coreml/lib/libalmazinfer_coreml.dylib"]}
+               {:name "almazinfer-raw"
+                :optional true
+                :darwin ["native/raw/lib/libalmazinfer_raw.dylib"]
+                :linux  ["libalmazinfer_raw.so"]}]
+
+ ;; dev/debug entry points under test/ — only the app itself ships from src/.
+ :aliases {:run   {:main-opts ["-m" "almaz.core"]}
+           :check {:extra-paths ["test"] :main-opts ["-m" "almaz.check"]}
+           :test  {:extra-paths ["test"] :main-opts ["-m" "almaz.test-runner"]}}
+
+ :tasks {run   "jolt -M:run"
+         check "jolt -M:check"
+         test  "jolt -M:test"}}

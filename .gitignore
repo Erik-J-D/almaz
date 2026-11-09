@@ -1,0 +1,22 @@
+# native build artifacts
+native/**/lib/
+native/tools/venv/
+native/tools/venv311/
+
+# large model weights + raw test files
+models/
+*.NEF
+
+# jolt / clj-kondo caches
+.jolt/
+.clj-kondo/
+.cpcache/
+.lsp/
+.nrepl-port
+
+# OS
+.DS_Store
+
+# editor (clangd) config with machine-local include paths, Python caches
+native/**/compile_flags.txt
+__pycache__/

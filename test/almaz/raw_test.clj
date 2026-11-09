@@ -1,0 +1,49 @@
+(ns almaz.raw-test
+  "Decode the bundled Nikon Z9 HE NEF through the LibRaw shim. Needs
+   native/raw/build.sh and DSC_9852.NEF in the project root."
+  (:require [clojure.test :refer [deftest is testing]]
+            [almaz.raw :as raw]
+            [almaz.pixels :as px]))
+
+(def nef "DSC_9852.NEF")
+
+(deftest raw-file-detection
+  (is (raw/raw-file? "/a/b/DSC_1.NEF"))
+  (is (raw/raw-file? "x.cr3"))
+  (is (not (raw/raw-file? "x.jpg")))
+  (is (not (raw/raw-file? "noext"))))
+
+(deftest full-decode
+  (testing "full resolution, demosaiced, plausible colours"
+    (let [img (raw/decode nef)]
+      (is (= [8280 5520] [(px/width img) (px/height img)]))
+      (let [[r g b] (px/pixel img 4140 2760)]
+        (is (every? #(< 0.0 % 1.0) [r g b]) "no channel clipped at the centre"))
+      (px/free-image! img))))
+
+(deftest embedded-thumbnail
+  (let [t (raw/thumbnail nef)]
+    (is (some? t))
+    (is (pos? (px/width t)))
+    (px/free-image! t)))
+
+(deftest decode-error
+  (is (thrown? Exception (raw/decode "nope.NEF"))))
+
+(def nef-meta
+  {:make "NIKON CORPORATION" :model "NIKON Z 9" :lens "NIKKOR Z 180-600mm f/5.6-6.3 VR"
+   :taken "2026:10:10 11:30:31" :iso 5000 :focal35 480 :orientation 1})
+
+(deftest camera-metadata
+  (testing "the NEF's own EXIF (it is TIFF-structured)"
+    (let [m (px/read-meta nef)]
+      (is (= nef-meta (select-keys m (keys nef-meta))))
+      (is (< (Math/abs (- 0.0005 (:exposure m))) 1e-9))
+      (is (= 8.0 (:fnumber m)))
+      (is (= 480.0 (:focal m)))))
+  (testing "LibRaw's decoded fields as the fallback for non-TIFF RAW formats"
+    (let [m (raw/metadata nef)]
+      (is (= 5000 (:iso m)))
+      (is (= 8.0 (:fnumber m)))
+      (is (< (Math/abs (- 0.0005 (:exposure m))) 1e-9))
+      (is (= "2026:10:10 11:30:31" (:taken m))))))
