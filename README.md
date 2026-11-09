@@ -11,12 +11,19 @@ See [PLAN.md](PLAN.md) for the target analysis and plan.
 
 - Opens RAW files at full resolution through LibRaw (Nikon HE included), plus
   JPEG / PNG / TIFF (8 and 16 bit). The camera's embedded preview shows while
-  the RAW decodes.
+  the RAW decodes. RAW files keep the exposure they were shot at: no
+  automatic brightening.
 - **Filters are layers.** Each layer (Denoise, Sharpen) runs over the composite
   of the layers below it and blends back through its **strength** and its own
   **mask**. Masks are painted with a soft round brush (size, hardness) and have
   a **feather** (gaussian) so edges blend smoothly into the layer below; Fill,
   Clear and Invert act on the whole mask.
+- **Light** layers adjust exposure (EV), contrast, highlights, shadows,
+  whites, blacks and saturation. They're computed as they're drawn, so the
+  sliders respond at once, and they mask and blend like the filters. Auto
+  exposure lifts the image until its brightest 1% reaches white (what raw
+  converters apply by default), on request. A histogram of the result sits
+  above the navigator.
 - **Autopilot** measures noise and sharpness when an image opens and adds the
   layers it needs at suggested strengths.
 - Processing is tiled (512 px, crossfaded overlaps, no seams) and starts at
@@ -25,8 +32,9 @@ See [PLAN.md](PLAN.md) for the target analysis and plan.
   feather only re-run the layers above. Tiles a mask leaves untouched are
   skipped.
 - Views: single, split (draggable divider) and side by side, with a navigator,
-  zoom presets, wheel zoom about the pointer, drag to pan, double click for
-  fit / 100%.
+  zoom presets, eased wheel / trackpad zoom about the pointer, drag to pan
+  (hold Space to pan while a mask brush is active), double click for fit /
+  100%.
 - Filmstrip of opened images; only the current one keeps full-resolution
   pixels.
 - Export the full-resolution composite as JPEG, 16-bit TIFF, or 8/16-bit PNG,
@@ -54,12 +62,13 @@ tool, selection, job progress) stays in plain cells.
 src/almaz/
   core.clj              the app: layout + -main
   ui/canvas.clj         image pane: rendering, overlays, pan/zoom/brush input
-  ui/sidebar.clj        navigator, autopilot, layer panels + mask tools
+  ui/sidebar.clj        histogram, navigator, autopilot, layer panels + mask tools
   ui/chrome.clj         top bar, status bar, filmstrip
   ui/units.clj          sizes in widget units (HiDPI)
   state.clj             reactive state: the relatum db + UI cells
   actions.clj           user commands
-  worker.clj            background thread: load, process, thumbnails, export
+  worker.clj            background thread: what to do next; processing, export
+  loading.clj           decoding, previews, thumbnails (for the worker)
   lifecycle.clj         native memory ownership (frees on the UI thread)
   doc.clj               data model: relatum tables (:doc, :layer), staleness
   view.clj              viewport math (pure)
@@ -175,6 +184,7 @@ Batch processing (no window) whenever an option is given:
 jolt run --showSettings DSC_9852.NEF                     # autopilot picks the filters
 jolt run --noise strength=60 -o out *.NEF                # adjust what autopilot chose
 jolt run --override --sharpen model=classic radius=2 x.jpg   # exactly these filters
+jolt run --light exposure=auto contrast=15 *.NEF         # light adjustments on top
 jolt run --help                                          # every option
 ```
 
