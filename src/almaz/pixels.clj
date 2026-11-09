@@ -265,12 +265,22 @@
 
 (defn save-image!
   "Write the full-resolution composite to `path` as `format` (see `formats`),
-   with `meta` (read-meta's map) embedded as EXIF."
+   with `meta` (read-meta's map) embedded as EXIF. The file is written to
+   `path`.part and renamed when complete: a large export takes seconds, and
+   anything opening `path` meanwhile would read a truncated image."
   [base layers {:keys [path quality meta] fmt :format}]
-  (with-open [a (ffi/confined-arena)]
-    (let [larr (write-layers a layers)
-          cpath (ffi/string->ptr a path)
-          mp (if meta (write-meta-struct a meta) ffi/null)]
-      (call-with-err (str "cannot write " path)
-                     #(save* base larr (int (count layers)) cpath (int (formats fmt)) (int quality) mp %)
-                     zero?))))
+  (let [part (str path ".part")]
+    (with-open [a (ffi/confined-arena)]
+      (let [larr (write-layers a layers)
+            cpath (ffi/string->ptr a part)
+            mp (if meta (write-meta-struct a meta) ffi/null)]
+        (try
+          (call-with-err (str "cannot write " path)
+                         #(save* base larr (int (count layers)) cpath (int (formats fmt)) (int quality) mp %)
+                         zero?)
+          (catch Exception e
+            (let [f (java.io.File. part)] (when (.isFile f) (.delete f)))
+            (throw e)))))
+    (when-not (.renameTo (java.io.File. part) (java.io.File. path))
+      (throw (ex-info (str "cannot write " path) {:path path})))
+    path))

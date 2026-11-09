@@ -142,6 +142,17 @@
             (is (= [40 30] [(px/width back) (px/height back)]))
             (is (every? true? (map (partial close? eps) (px/pixel img 20 15) (px/pixel back 20 15))))
             (px/free-image! back)))))
+    (testing "the file appears only once it's complete: written aside, then renamed"
+      (let [path (str dir "/atomic.png")]
+        (spit path "previous export")
+        ;; the side file can't be created, so the write fails before the rename
+        (.mkdirs (java.io.File. (str path ".part")))
+        (is (thrown? Exception (px/save-image! img [] {:path path :format :png16 :quality 95})))
+        (is (= "previous export" (slurp path)) "a failed export leaves the old file alone")
+        (.delete (java.io.File. (str path ".part")))
+        (px/save-image! img [] {:path path :format :png16 :quality 95})
+        (is (= [40 30] (let [b (px/load-image path)] (try [(px/width b) (px/height b)] (finally (px/free-image! b))))))
+        (is (not (.exists (java.io.File. (str path ".part")))))))
     (testing "a missing file is an error, not a crash"
       (is (thrown? Exception (px/load-image (str dir "/nope.png")))))
     (px/free-image! img)))
