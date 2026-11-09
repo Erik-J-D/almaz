@@ -778,6 +778,30 @@ void almz_composite_into(AlmzImg *dst, const AlmzImg *base, const AlmzLayer *lay
   almz_img_pyr_update(dst, 0, 0, dst->w, dst->h);
 }
 
+/* Rows of the full-resolution composite for the writers, made a band at a
+ * time across all cores (the encoders themselves are serial). */
+enum { BAND_ROWS = 64 };
+typedef struct {
+  const AlmzImg *base;
+  const AlmzLayer *layers;
+  int n, y0;   /* first row in buf, -1 when empty */
+  uint16_t *buf;
+} row_src;
+
+static void band_rows(void *p, int r0, int r1) {
+  row_src *s = (row_src *)p;
+  for (int r = r0; r < r1; r++)
+    composite_row(s->base, s->layers, s->n, s->y0 + r, s->buf + (size_t)r * s->base->w * 3);
+}
+
+static uint16_t *row_at(row_src *s, int y) {
+  if (s->y0 < 0 || y < s->y0 || y >= s->y0 + BAND_ROWS) {
+    s->y0 = y - y % BAND_ROWS;
+    par_for(MIN(BAND_ROWS, s->base->h - s->y0), 1, band_rows, s);
+  }
+  return s->buf + (size_t)(y - s->y0) * s->base->w * 3;
+}
+
 /* TIFF: the camera fields as real tags, the EXIF ones in an EXIF directory. */
 static void tiff_main_tags(TIFF *t, const AlmzMeta *m) {
   if (m->make[0]) TIFFSetField(t, TIFFTAG_MAKE, m->make);
@@ -817,7 +841,8 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
   const int w = base->w, h = base->h;
   uint8_t *exif = NULL;
   const size_t exif_len = meta ? almz_exif_build(meta, &exif) : 0;
-  uint16_t *row = (uint16_t *)malloc((size_t)w * 3 * sizeof(uint16_t));
+  row_src src = {base, layers, n, -1, (uint16_t *)malloc((size_t)w * 3 * BAND_ROWS * sizeof(uint16_t))};
+  uint16_t *row;
   uint8_t *row8 = (uint8_t *)malloc((size_t)w * 3);
   int rc = 0;
   if (format == ALMZ_FMT_JPEG) {
@@ -851,7 +876,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
       free(app1);
     }
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       for (int i = 0; i < w * 3; i++) row8[i] = (uint8_t)((row[i] + 128) / 257);
       JSAMPROW r = row8;
       jpeg_write_scanlines(&ci, &r, 1);
@@ -873,6 +898,9 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     }
     png_init_io(p, f);
     const int bits = format == ALMZ_FMT_PNG16 ? 16 : 8;
+    /* zlib's effort barely pays on photographs (16-bit: level 1 is half the
+     * time of the default for ~2% more bytes) */
+    png_set_compression_level(p, bits == 16 ? 1 : 3);
     png_set_IHDR(p, info, w, h, bits, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
     if (exif_len) png_set_eXIf_1(p, info, (png_uint_32)exif_len, exif);
@@ -881,7 +909,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     if (bits == 16) png_set_swap(p);
 #endif
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       if (bits == 16)
         png_write_row(p, (png_bytep)row);
       else {
@@ -907,7 +935,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     if (meta) tiff_main_tags(t, meta);
     if (with_exif) TIFFSetField(t, TIFFTAG_EXIFIFD, (uint64_t)0); /* placeholder, patched below */
     for (int y = 0; y < h; y++) {
-      composite_row(base, layers, n, y, row);
+      row = row_at(&src, y);
       if (TIFFWriteScanline(t, row, y, 0) < 0) {
         set_err(err, "TIFF write failed");
         rc = -1;
@@ -924,7 +952,7 @@ int almz_save(const AlmzImg *base, const AlmzLayer *layers, int n,
     rc = -1;
   }
 done:
-  free(row);
+  free(src.buf);
   free(row8);
   free(exif);
   return rc;
