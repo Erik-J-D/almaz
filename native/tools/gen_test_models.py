@@ -4,13 +4,17 @@ import numpy as np
 
 out = "test/almaz/fixtures"
 shape = [1, 3, 4, 4]
+# Pin the IR version: onnx writes its newest by default, which an older ONNX
+# Runtime refuses (Microsoft's 1.31.1 release reads IR <= 13). The NAFNet
+# exports are IR 8 too.
+IR_VERSION = 8
 
 # identity: output = input
 X = helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)
 Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)
 node = helper.make_node("Identity", ["input"], ["output"])
 graph = helper.make_graph([node], "identity", [X], [Y])
-model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=IR_VERSION)
 onnx.save(model, f"{out}/identity.onnx")
 
 # add1: output = input + 1.0 (a real computation, proves marshalling both ways)
@@ -19,7 +23,7 @@ X = helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)
 Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)
 node = helper.make_node("Add", ["input", "c"], ["output"])
 graph = helper.make_graph([node], "add1", [X], [Y], [c])
-model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=IR_VERSION)
 onnx.save(model, f"{out}/add1.onnx")
 
 print("wrote identity.onnx and add1.onnx")

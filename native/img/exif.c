@@ -42,7 +42,10 @@ static uint32_t u32(const tiff_t *t, const uint8_t *b) {
                : (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | (uint32_t)b[3];
 }
 
-enum { T_BYTE = 1, T_ASCII = 2, T_SHORT = 3, T_LONG = 4, T_RATIONAL = 5, T_UNDEF = 7, T_SRATIONAL = 10 };
+/* T_IFD: an offset to a sub-IFD; libtiff 4.5 writes the EXIF pointer with it
+ * where 4.7 writes T_LONG, and other writers use either. */
+enum { T_BYTE = 1, T_ASCII = 2, T_SHORT = 3, T_LONG = 4, T_RATIONAL = 5, T_UNDEF = 7, T_SRATIONAL = 10,
+       T_IFD = 13 };
 
 typedef struct {
   uint32_t tag, type, count, value_off; /* value_off: offset of the value (inline or pointed) */
@@ -52,7 +55,7 @@ static int type_size(uint32_t type) {
   switch (type) {
   case T_BYTE: case T_ASCII: case T_UNDEF: return 1;
   case T_SHORT: return 2;
-  case T_LONG: return 4;
+  case T_LONG: case T_IFD: return 4;
   case T_RATIONAL: case T_SRATIONAL: return 8;
   default: return 0;
   }
@@ -89,7 +92,8 @@ static double get_num(const tiff_t *t, const entry_t *e) {
   uint8_t b[8];
   switch (e->type) {
   case T_SHORT: return read_at(&t->src, e->value_off, b, 2) ? u16(t, b) : 0;
-  case T_LONG: return read_at(&t->src, e->value_off, b, 4) ? u32(t, b) : 0;
+  case T_LONG:
+  case T_IFD: return read_at(&t->src, e->value_off, b, 4) ? u32(t, b) : 0;
   case T_RATIONAL:
   case T_SRATIONAL: {
     if (!read_at(&t->src, e->value_off, b, 8)) return 0;
