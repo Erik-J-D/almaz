@@ -125,6 +125,25 @@ test/almaz/             clojure.test suites (pure + native)
 
 ## Build
 
+On macOS, with jolt and Homebrew installed, `make` does everything: installs
+the missing Homebrew packages, fetches LibRaw and the BUI kit into `.deps/`
+(pinned to the commits CI uses) and builds the native libraries.
+
+```sh
+make                        # build everything
+make run                    # the app; make run ARGS="x.NEF" or ARGS="--help"
+make test                   # all suites
+make check                  # load every namespace
+make samples                # fetch the RAW test files
+make clean                  # remove native/*/lib
+make distclean              # also remove .deps/
+```
+
+`make run/test/check` set `DYLD_LIBRARY_PATH` so glimmer-bui finds
+`libbui.dylib`. Plain `jolt run` doesn't.
+
+By hand:
+
 ```sh
 # BUI kit (see glimmer-bui's README), then:
 native/img/build.sh           # needs libjpeg, libpng, libtiff (brew install jpeg-turbo libpng libtiff)
@@ -133,13 +152,12 @@ native/raw/build.sh           # needs LibRaw, below
 native/coreml/build.sh        # optional (our own Core ML shim; needs Xcode)
 ```
 
-**glimmer-bui**: `deps.edn` points at a local checkout
-(`../jlt-commons/glimmer-bui`, branch `props-diff-events`), which fixes the
+**glimmer-bui**: `deps.edn` pins a git commit of glimmer-bui that fixes the
 flicker/jitter (props are diffed on re-render instead of re-applied, which
 relaid the whole UI and snapped sliders back mid-drag), passes pointer
 positions to raw events, routes panel children into the panel body, and adds
-layout/colour props, canvas items and the file dialog. Switch back to a git
-coordinate once that branch is merged.
+layout/colour props, canvas items and the file dialog. jolt fetches it; no
+local checkout needed.
 
 **LibRaw** (the 202611 snapshot, with the Nikon HE decoder):
 
