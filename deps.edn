@@ -15,8 +15,8 @@
                                  :git/sha "d54dd02b4a859864ead02a527e2d765682ff8533"}
         ;; in-memory relational store: the document/layer data model
         yogthos/relatum {:git/url "https://github.com/yogthos/relatum"
-                         :git/tag "v0.3.0"
-                         :git/sha "27530913706318d9228e82c567ddd335f28a77c2"}}
+                         :git/tag "v0.4.0"
+                         :git/sha "6fefe4da6edc1a0ccf2783fe63c913fa810707fc"}}
 
  ;; the pixel engine (images, masks, compositing, tiles, PNG/JPEG/TIFF), the
  ;; ONNX Runtime C API (CPU + CoreML/CUDA execution providers), our CoreML
